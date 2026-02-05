@@ -23,7 +23,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # Configuration de base
 # -----------------------------
 
-APP_TITLE = "Proxy Panel"
+APP_TITLE = "Eagle Proxy Panel"
 
 PROXY_SOURCE_FILE = "/root/proxies.txt"
 DB_FILE = "/root/proxy_panel_db.json"
@@ -232,7 +232,7 @@ def check_proxy(proxy_line: str, timeout: float = CHECK_TIMEOUT) -> bool:
 # Templates
 # =============================
 
-# ---- LOGIN : même structure, couleurs néon + photo de proxy ----
+# ---- LOGIN : thème “enterprise” sombre / bleu ----
 LOGIN_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -245,7 +245,7 @@ LOGIN_TEMPLATE = """
     body {
       margin: 0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      /* Photo de datacenter + overlay sombre néon */
+      /* Photo de datacenter + overlay néon */
       background-image:
         radial-gradient(circle at top left, rgba(0, 245, 255, 0.25), transparent 55%),
         radial-gradient(circle at bottom right, rgba(255, 45, 251, 0.22), transparent 55%),
@@ -262,7 +262,7 @@ LOGIN_TEMPLATE = """
     }
     .card {
       width: 380px;
-      border-radius: 20px;
+      border-radius: 24px;
       padding: 28px 30px 26px;
       background:
         radial-gradient(circle at top left, rgba(0,245,255,0.09), transparent 60%),
@@ -270,31 +270,58 @@ LOGIN_TEMPLATE = """
         rgba(15,23,42,0.96);
       border: 1px solid rgba(59,130,246,0.6);
       box-shadow:
-        0 0 30px rgba(0,245,255,0.4),
-        0 30px 80px rgba(0,0,0,0.9);
+        0 0 40px rgba(0,245,255,0.55),
+        0 35px 90px rgba(0,0,0,0.95);
       backdrop-filter: blur(6px);
+      text-align: left;
     }
-    .badge {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: .16em;
-      color: #a5b4fc;
-      margin-bottom: 8px;
+
+    /* --- LOGO EAGLE au centre --- */
+    .eagle-logo-wrap {
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+      justify-content:center;
+      margin-bottom:18px;
     }
-    .logo {
-      font-weight: 700;
-      letter-spacing: .24em;
-      font-size: 12px;
-      text-transform: uppercase;
-      color: #e5e7eb;
-      margin-bottom: 14px;
+    .eagle-mark {
+      width:60px;
+      height:60px;
+      border-radius:20px;
+      background: radial-gradient(circle at 0% 0%, #22c55e, #0ea5e9 40%, #a855f7 85%);
+      box-shadow:
+        0 0 25px rgba(56,189,248,0.95),
+        0 0 35px rgba(168,85,247,0.85);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      color:#0b1120;
+      font-weight:800;
+      font-size:22px;
+      letter-spacing:.12em;
+      text-transform:uppercase;
     }
-    .logo span {
-      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
-      -webkit-background-clip: text;
-      background-clip: text;
-      color: transparent;
+    .eagle-mark span {
+      transform:translateY(1px);
     }
+    .eagle-text-main {
+      margin-top:10px;
+      font-size:12px;
+      letter-spacing:.32em;
+      text-transform:uppercase;
+      color:#9ca3af;
+    }
+    .eagle-text-sub {
+      margin-top:4px;
+      font-size:13px;
+      letter-spacing:.16em;
+      text-transform:uppercase;
+      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
+      -webkit-background-clip:text;
+      background-clip:text;
+      color:transparent;
+    }
+
     h1 {
       margin: 0 0 6px;
       font-size: 22px;
@@ -341,8 +368,8 @@ LOGIN_TEMPLATE = """
       color: #0b1120;
       background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7);
       box-shadow:
-        0 0 25px rgba(34,197,94,0.8),
-        0 0 40px rgba(14,165,233,0.7);
+        0 0 25px rgba(34,197,94,0.9),
+        0 0 40px rgba(14,165,233,0.8);
     }
     .btn:hover { filter: brightness(1.08); }
     .error {
@@ -354,8 +381,12 @@ LOGIN_TEMPLATE = """
 </head>
 <body>
   <div class="card">
-    <div class="badge">Admin console</div>
-    <div class="logo"><span>{{ title }}</span></div>
+    <div class="eagle-logo-wrap">
+      <div class="eagle-mark"><span>E</span></div>
+      <div class="eagle-text-main">EAGLE</div>
+      <div class="eagle-text-sub">Eagle Proxy Panel</div>
+    </div>
+
     <h1>Sign in</h1>
     <div class="subtitle">Secure access to your proxy management dashboard.</div>
 
@@ -379,7 +410,7 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
-# ---- LAYOUT : même structure, néon + même “check proxies” ----
+# ---- LAYOUT : thème dashboard corporate ----
 LAYOUT_TEMPLATE = """
 {% macro nav_link(href, label, active_name) -%}
   <a href="{{ href }}" class="nav-link {{ 'active' if active == active_name else '' }}">{{ label }}</a>
@@ -394,28 +425,24 @@ LAYOUT_TEMPLATE = """
   <style>
     :root {
       --bg-main: #020617;
+      --bg-elevated: #020617;
       --text-main: #e5e7eb;
       --text-muted: #9ca3af;
-      --accent-primary: #0ea5e9;   /* cyan */
-      --accent-secondary: #a855f7; /* violet */
-      --accent-tertiary: #22c55e;  /* vert néon */
+      --accent-primary: #2563eb;
+      --accent-primary-soft: rgba(37,99,235,0.18);
+      --accent-secondary: #38bdf8;
       --accent-ok: #22c55e;
-      --accent-fail: #fb923c;
+      --accent-fail: #f97316;
       --accent-warn: #eab308;
     }
     * { box-sizing:border-box; }
     body {
       margin:0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      /* même photo de fond que login */
-      background-image:
-        radial-gradient(circle at 0% 0%, rgba(14,165,233,0.20), transparent 60%),
-        radial-gradient(circle at 100% 0%, rgba(168,85,247,0.18), transparent 60%),
-        linear-gradient(180deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
-        url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
-      background-size: cover;
-      background-position: center;
-      background-attachment: fixed;
+      background:
+        radial-gradient(circle at 0% 0%, rgba(37,99,235,0.16), transparent 60%),
+        radial-gradient(circle at 100% 0%, rgba(56,189,248,0.12), transparent 60%),
+        linear-gradient(180deg,#020617,#020617);
       color:var(--text-main);
       min-height:100vh;
     }
@@ -442,10 +469,7 @@ LAYOUT_TEMPLATE = """
       text-transform:uppercase;
     }
     .brand-title span {
-      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
-      -webkit-background-clip:text;
-      background-clip:text;
-      color:transparent;
+      color:#60a5fa;
     }
     .brand-sub {
       font-size:11px;
@@ -460,23 +484,20 @@ LAYOUT_TEMPLATE = """
       font-size:13px;
       padding:7px 14px;
       border-radius:999px;
-      color:#e5e7eb;
+      color:var(--text-muted);
       text-decoration:none;
-      border:1px solid rgba(148,163,184,0.45);
-      background:rgba(15,23,42,0.86);
-      box-shadow:0 0 0 1px rgba(15,23,42,0.9);
+      border:1px solid rgba(148,163,184,0.35);
+      background:rgba(15,23,42,0.95);
     }
     .nav-link:hover {
+      color:#f9fafb;
       border-color:var(--accent-primary);
-      box-shadow:0 0 14px rgba(14,165,233,0.7);
     }
     .nav-link.active {
-      color:#0b1120;
+      color:#f9fafb;
       background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
       border-color:transparent;
-      box-shadow:
-        0 0 18px rgba(14,165,233,0.9),
-        0 0 28px rgba(168,85,247,0.7);
+      box-shadow:0 12px 30px rgba(37,99,235,0.75);
     }
     .logout-link {
       font-size:12px;
@@ -490,7 +511,6 @@ LAYOUT_TEMPLATE = """
     .logout-link:hover {
       border-color:var(--accent-secondary);
       color:#f9fafb;
-      box-shadow:0 0 14px rgba(168,85,247,0.7);
     }
 
     h2 {
@@ -506,16 +526,12 @@ LAYOUT_TEMPLATE = """
     }
     .card {
       background:
-        radial-gradient(circle at top left, rgba(14,165,233,0.20), transparent 55%),
-        radial-gradient(circle at bottom right, rgba(168,85,247,0.18), transparent 55%),
-        rgba(15,23,42,0.92);
-      border-radius:18px;
+        radial-gradient(circle at top left, rgba(37,99,235,0.10), transparent 55%),
+        linear-gradient(to bottom right, #020617, #020617);
+      border-radius:16px;
       padding:16px 18px;
-      border:1px solid rgba(59,130,246,0.6);
-      box-shadow:
-        0 0 26px rgba(14,165,233,0.45),
-        0 24px 70px rgba(0,0,0,0.9);
-      backdrop-filter: blur(4px);
+      border:1px solid rgba(148,163,184,0.32);
+      box-shadow:0 20px 60px rgba(15,23,42,1);
     }
     .card h3 {
       margin:0 0 6px;
@@ -548,7 +564,7 @@ LAYOUT_TEMPLATE = """
       color:var(--text-muted);
     }
     tr:hover td {
-      background:rgba(15,23,42,0.9);
+      background:rgba(15,23,42,0.92);
     }
 
     .pill {
@@ -556,9 +572,8 @@ LAYOUT_TEMPLATE = """
       padding:3px 8px;
       border-radius:999px;
       font-size:11px;
-      border:1px solid rgba(148,163,184,0.6);
-      color:#e5e7eb;
-      background:rgba(15,23,42,0.96);
+      border:1px solid rgba(148,163,184,0.45);
+      color:var(--text-muted);
     }
 
     .btn {
@@ -570,23 +585,21 @@ LAYOUT_TEMPLATE = """
       border:none;
       cursor:pointer;
       font-size:13px;
-      color:#020617;
-      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary),var(--accent-tertiary));
-      box-shadow:
-        0 0 22px rgba(14,165,233,0.9),
-        0 0 32px rgba(168,85,247,0.7);
+      color:#f9fafb;
+      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
+      box-shadow:0 12px 30px rgba(37,99,235,0.7);
     }
-    .btn:hover { filter:brightness(1.06); }
+    .btn:hover { filter:brightness(1.05); }
 
     .btn-secondary {
       background:rgba(15,23,42,0.96);
-      border:1px solid rgba(148,163,184,0.7);
-      color:var(--text-main);
+      border:1px solid rgba(148,163,184,0.6);
+      color:var(--text-muted);
       box-shadow:none;
     }
     .btn-secondary:hover {
       border-color:var(--accent-primary);
-      box-shadow:0 0 16px rgba(14,165,233,0.7);
+      color:#e5e7eb;
     }
 
     .status-badge {
@@ -594,30 +607,26 @@ LAYOUT_TEMPLATE = """
       border-radius:999px;
       font-size:11px;
       font-weight:500;
-      border:1px solid transparent;
     }
     .status-ok {
       background:rgba(34,197,94,0.16);
       color:#bbf7d0;
-      border-color:rgba(34,197,94,0.8);
-      box-shadow:0 0 10px rgba(34,197,94,0.7);
+      border:1px solid rgba(34,197,94,0.7);
     }
     .status-fail {
-      background:rgba(248,113,113,0.16);
+      background:rgba(249,115,22,0.16);
       color:#fed7aa;
-      border-color:rgba(248,113,113,0.9);
-      box-shadow:0 0 10px rgba(248,113,113,0.7);
+      border:1px solid rgba(249,115,22,0.7);
     }
     .status-unknown {
-      background:rgba(148,163,184,0.18);
+      background:rgba(148,163,184,0.15);
       color:#e5e7eb;
-      border-color:rgba(148,163,184,0.9);
+      border:1px solid rgba(148,163,184,0.65);
     }
     .status-checking {
       background:rgba(234,179,8,0.18);
       color:#facc15;
-      border-color:rgba(234,179,8,0.9);
-      box-shadow:0 0 10px rgba(250,204,21,0.7);
+      border:1px solid rgba(234,179,8,0.85);
     }
 
     .form-row {
@@ -633,22 +642,22 @@ LAYOUT_TEMPLATE = """
       margin-bottom:3px;
     }
     .form-row input {
-      border-radius:999px;
+      border-radius:10px;
       border:1px solid rgba(51,65,85,0.9);
-      background:rgba(2,6,23,0.96);
+      background:#020617;
       color:#e5e7eb;
-      padding:7px 12px;
+      padding:7px 9px;
       min-width:140px;
       font-size:13px;
     }
     .form-row input:focus {
       outline:none;
       border-color:var(--accent-primary);
-      box-shadow:0 0 0 1px rgba(14,165,233,0.6);
+      box-shadow:0 0 0 1px rgba(37,99,235,0.5);
     }
 
     .error-msg {
-      color:#fb7185;
+      color:var(--accent-fail);
       font-size:12px;
       margin-top:4px;
     }
@@ -658,9 +667,9 @@ LAYOUT_TEMPLATE = """
       font-size:11px;
       color:var(--text-muted);
       text-align:center;
-      text-shadow:0 0 10px rgba(15,23,42,0.9);
     }
 
+    /* Progress bar zone */
     .progress-wrapper {
       margin-top:10px;
       font-size:12px;
@@ -670,17 +679,16 @@ LAYOUT_TEMPLATE = """
       width:100%;
       height:7px;
       border-radius:999px;
-      background:rgba(15,23,42,0.96);
+      background:rgba(15,23,42,0.9);
       overflow:hidden;
       margin-top:6px;
       border:1px solid rgba(31,41,55,0.9);
-      box-shadow:0 0 14px rgba(14,165,233,0.6);
     }
     .progress-bar-inner {
       height:100%;
       width:0%;
       border-radius:999px;
-      background:linear-gradient(90deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
+      background:linear-gradient(90deg,var(--accent-primary),var(--accent-secondary));
       transition:width .18s ease-out;
     }
 
@@ -688,14 +696,65 @@ LAYOUT_TEMPLATE = """
       header { flex-direction:column; align-items:flex-start; gap:10px; }
       .shell { padding:14px 14px 24px; }
     }
+  
+    /* --- EAGLE HEADER LOGO --- */
+    .eagle-header {
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+    .eagle-header-mark {
+      width:32px;
+      height:32px;
+      border-radius:12px;
+      background: radial-gradient(circle at 0% 0%, #22c55e, #0ea5e9 45%, #a855f7 90%);
+      box-shadow:
+        0 0 12px rgba(56,189,248,0.85),
+        0 0 18px rgba(168,85,247,0.7);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      color:#0b1120;
+      font-weight:800;
+      font-size:16px;
+      letter-spacing:.12em;
+      text-transform:uppercase;
+    }
+    .eagle-header-mark span {
+      transform:translateY(1px);
+    }
+    .eagle-header-text {
+      display:flex;
+      flex-direction:column;
+      gap:2px;
+    }
+    .eagle-header-title {
+      font-size:13px;
+      letter-spacing:.18em;
+      text-transform:uppercase;
+      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
+      -webkit-background-clip:text;
+      background-clip:text;
+      color:transparent;
+    }
+    .eagle-header-sub {
+      font-size:11px;
+      color:var(--text-muted);
+    }
+
   </style>
 </head>
 <body>
   <div class="shell">
     <header>
       <div class="brand">
-        <div class="brand-title"><span>{{ title }}</span></div>
-        <div class="brand-sub">Internal proxy management console</div>
+        <div class="eagle-header">
+          <div class="eagle-header-mark"><span>E</span></div>
+          <div class="eagle-header-text">
+            <div class="eagle-header-title">Eagle Proxy Panel</div>
+            <div class="eagle-header-sub">Internal proxy management console</div>
+          </div>
+        </div>
       </div>
       <nav>
         {{ nav_link(url_for('dashboard'), 'Dashboard', 'dashboard') }}
@@ -1097,6 +1156,7 @@ def proxies():
           progressLabel.textContent = '0%';
           progressDetail.textContent = 'Starting...';
 
+          // Met tous en CHECKING au début
           rows.forEach(row => {
             const proxy = row.getAttribute('data-proxy');
             setStatus(proxy, 'checking');
