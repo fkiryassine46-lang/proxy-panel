@@ -2,162 +2,238 @@
 import os
 import json
 import datetime
+import socket
 from functools import wraps
-from io import BytesIO
 
-import requests
-from flask import (
-    Flask,
-    request,
-    redirect,
-    url_for,
-    render_template_string,
-    session,
-    send_file,
-    jsonify,
-    abort,
-)
+from flask import Flask, request, redirect, url_for, render_template_string, session, send_file, abort
 from werkzeug.security import generate_password_hash, check_password_hash
-
-# -----------------------------
-# Configuration de base
-# -----------------------------
 
 APP_TITLE = "Proxy Panel"
 
-PROXY_SOURCE_FILE = "/root/proxies.txt"
-DB_FILE = "/root/proxy_panel_db.json"
-CONFIG_FILE = "/root/proxy_panel_config.json"
-
-CHECK_TEST_URL = "https://www.google.com"
-CHECK_TIMEOUT = 20  # secondes
-
-app = Flask(__name__)
-app.secret_key = "change-me-if-you-want"  # pour la session Flask
-
+DEFAULT_CONFIG = {
+    "admin_username": "admin",
+    "password_hash": generate_password_hash("admin"),
+    "listen_host": "0.0.0.0",
+    "listen_port": 1991,
+    "proxy_source": "/root/proxies.txt",
+    "db_file": "/root/proxy_panel_db.json",
+    "config_file": "/root/proxy_panel_config.json",
+}
 
 # =============================
-# Utilitaires fichiers
+# Helper functions for config/db
 # =============================
 
 def load_json(path, default):
-    if not os.path.exists(path):
-        return default
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception:
-        return default
+        pass
+    return default
 
 
 def save_json(path, data):
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, path)
-
-
-# =============================
-# Config admin (login / pass)
-# =============================
-
-def ensure_config():
-    cfg = load_json(CONFIG_FILE, {})
-    changed = False
-    if "admin_username" not in cfg:
-        cfg["admin_username"] = "admin"
-        changed = True
-    if "password_hash" not in cfg:
-        cfg["password_hash"] = generate_password_hash("lolopolo")
-        changed = True
-    if changed:
-        save_json(CONFIG_FILE, cfg)
-    return cfg
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 def get_config():
-    return ensure_config()
+    cfg_path = DEFAULT_CONFIG["config_file"]
+    cfg = load_json(cfg_path, DEFAULT_CONFIG)
+    # ensure all keys exist
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
 
 
-def set_admin_password(new_username, new_password):
-    cfg = get_config()
-    if new_username:
-        cfg["admin_username"] = new_username
-    if new_password:
-        cfg["password_hash"] = generate_password_hash(new_password)
-    save_json(CONFIG_FILE, cfg)
-
-
-# =============================
-# DB clients / proxies
-# =============================
-
-def ensure_db():
-    db = load_json(DB_FILE, {})
-    changed = False
-    if "clients" not in db:
-        db["clients"] = []
-        changed = True
-    if "assigned_proxies" not in db:
-        db["assigned_proxies"] = {}  # proxy_line -> client_id
-        changed = True
-    if changed:
-        save_json(DB_FILE, db)
-    return db
+def save_config(cfg):
+    cfg_path = DEFAULT_CONFIG["config_file"]
+    save_json(cfg_path, cfg)
 
 
 def get_db():
-    return ensure_db()
+    cfg = get_config()
+    db_path = cfg["db_file"]
+    db = load_json(db_path, {"clients": {}, "assignments": {}})
+    db.setdefault("clients", {})
+    db.setdefault("assignments", {})
+    return db
 
 
 def save_db(db):
-    save_json(DB_FILE, db)
-
-
-def next_client_id(db):
-    if not db["clients"]:
-        return 1
-    return max(c["id"] for c in db["clients"]) + 1
+    cfg = get_config()
+    db_path = cfg["db_file"]
+    save_json(db_path, db)
 
 
 # =============================
-# Proxies: chargement + stats
+# Proxy parsing / assignment
 # =============================
 
-def load_proxy_list():
-    if not os.path.exists(PROXY_SOURCE_FILE):
-        return []
-    proxies = []
-    with open(PROXY_SOURCE_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            proxies.append(line)
-    return proxies
-
-
-def compute_stats():
-    db = get_db()
-    all_proxies = load_proxy_list()
-    assigned = set(db["assigned_proxies"].keys())
-    total = len(all_proxies)
-    assigned_count = len(assigned & set(all_proxies))
-    available_count = total - assigned_count
-    clients_count = len(db["clients"])
+def parse_proxy_line(line):
+    """
+    Parse lines in format:
+      host:port
+      host:port:user:pass
+    Return dict with keys: host, port, user, password (user/password optional).
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split(":")
+    if len(parts) < 2:
+        return None
+    host = parts[0]
+    port = parts[1]
+    user = parts[2] if len(parts) > 2 else None
+    password = parts[3] if len(parts) > 3 else None
     return {
-        "total_proxies": total,
-        "assigned_proxies": assigned_count,
-        "available_proxies": available_count,
-        "clients_count": clients_count,
-        "proxy_source": PROXY_SOURCE_FILE,
-        "db_file": DB_FILE,
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
     }
 
 
+def load_all_proxies():
+    cfg = get_config()
+    path = cfg["proxy_source"]
+    proxies = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                p = parse_proxy_line(line)
+                if p:
+                    proxies.append(p)
+    return proxies
+
+
+def build_proxy_url(proxy):
+    """Return proxy URL string from parsed proxy dict, e.g. http://user:pass@host:port."""
+    auth = ""
+    if proxy.get("user") and proxy.get("password"):
+        auth = f"{proxy['user']}:{proxy['password']}@"
+    return f"http://{auth}{proxy['host']}:{proxy['port']}"
+
+
+def get_all_proxy_ids():
+    """Use host:port as a unique proxy key."""
+    proxies = load_all_proxies()
+    proxy_ids = []
+    for p in proxies:
+        proxy_ids.append(f"{p['host']}:{p['port']}")
+    return proxy_ids
+
+
+def compute_stats():
+    cfg = get_config()
+    db = get_db()
+    proxies = load_all_proxies()
+    total_proxies = len(proxies)
+    clients_count = len(db["clients"])
+
+    all_ids = set(get_all_proxy_ids())
+    assignments = db["assignments"]
+    assigned_ids = set(assignments.values())
+    available_ids = all_ids - assigned_ids
+
+    return {
+        "total_proxies": total_proxies,
+        "clients_count": clients_count,
+        "assigned_proxies": len(assigned_ids),
+        "available_proxies": len(available_ids),
+        "proxy_source": cfg["proxy_source"],
+        "db_file": cfg["db_file"],
+    }
+
+
+def assign_proxies_evenly():
+    """
+    Read clients and proxies. Assign proxies to each client as evenly as possible.
+    Clients have "count" specifying desired number of proxies.
+    """
+    db = get_db()
+    clients = db["clients"]
+    proxies = get_all_proxy_ids()
+    assignments = {}  # proxy_id -> client_name
+
+    if not clients or not proxies:
+        db["assignments"] = assignments
+        save_db(db)
+        return
+
+    client_list = [(name, info["count"]) for name, info in clients.items()]
+    client_list.sort(key=lambda x: x[0])
+
+    expanded_clients = []
+    for name, count in client_list:
+        for _ in range(count):
+            expanded_clients.append(name)
+
+    if not expanded_clients:
+        db["assignments"] = {}
+        save_db(db)
+        return
+
+    assigned = {}
+    i = 0
+    for p in proxies:
+        client_name = expanded_clients[i % len(expanded_clients)]
+        assigned[p] = client_name
+        i += 1
+
+    db["assignments"] = assigned
+    save_db(db)
+
+
+def get_client_proxies(client_name):
+    """Return list of (proxy_id, proxy_url) for given client."""
+    db = get_db()
+    assignments = db["assignments"]
+    proxies = load_all_proxies()
+    proxy_map = {}
+    for p in proxies:
+        pid = f"{p['host']}:{p['port']}"
+        proxy_map[pid] = p
+
+    result = []
+    for pid, assigned_client in assignments.items():
+        if assigned_client == client_name and pid in proxy_map:
+            p = proxy_map[pid]
+            result.append((pid, build_proxy_url(p)))
+    return result
+
+
+def check_proxy(proxy, timeout=2.0):
+    """
+    Basic TCP connectivity check.
+    """
+    try:
+        host = proxy["host"]
+        port = int(proxy["port"])
+    except Exception:
+        return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((host, port))
+        return True
+    except Exception:
+        return False
+
+
 # =============================
-# Login / sessions
+# Flask app and auth
 # =============================
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("PROXY_PANEL_SECRET", "change_me_please")
+
 
 def login_required(f):
     @wraps(f)
@@ -169,296 +245,275 @@ def login_required(f):
 
 
 # =============================
-# Parsing / check des proxies
+# TEMPLATES (HTML/CSS)
 # =============================
 
-def parse_proxy_line(line: str):
-    """
-    Accepte :
-      IP:PORT
-      IP:PORT:USER:PASS
-    Retourne dict ou None si invalide.
-    """
-    line = line.strip()
-    if not line or line.startswith("#"):
-        return None
-    parts = line.split(":")
-    if len(parts) == 2:
-        host, port = parts
-        user = password = None
-    elif len(parts) == 4:
-        host, port, user, password = parts
-    else:
-        return None
-    try:
-        port = int(port)
-    except ValueError:
-        return None
-    return {
-        "host": host,
-        "port": port,
-        "user": user,
-        "password": password,
-    }
-
-
-def build_proxy_url(info: dict) -> str:
-    if info["user"] and info["password"]:
-        return f"http://{info['user']}:{info['password']}@{info['host']}:{info['port']}"
-    else:
-        return f"http://{info['host']}:{info['port']}"
-
-
-def check_proxy(proxy_line: str, timeout: float = CHECK_TIMEOUT) -> bool:
-    """
-    Test via HTTPS sur Google.
-    True = OK, False = FAIL.
-    """
-    info = parse_proxy_line(proxy_line)
-    if not info:
-        return False
-
-    proxy_url = build_proxy_url(info)
-    proxies = {"http": proxy_url, "https": proxy_url}
-
-    try:
-        r = requests.get(CHECK_TEST_URL, proxies=proxies, timeout=timeout)
-        return 200 <= r.status_code < 400
-    except Exception:
-        return False
-
-
-# =============================
-# Templates
-# =============================
-
-# ---- LOGIN : thème “enterprise” sombre / bleu ----
-LOGIN_TEMPLATE = """<!doctype html>
+# ---- LOGIN THEME (modern + bg server) ----
+LOGIN_TEMPLATE = """
+<!doctype html>
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <title>{{ title }} · Connexion</title>
+  <title>{{ title }} - Connexion</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
-    :root{
-      --bg0:#070914;
-      --bg1:#0a1024;
-      --card: rgba(20, 24, 40, .62);
-      --card2: rgba(20, 24, 40, .42);
-      --stroke: rgba(255,255,255,.08);
-      --stroke2: rgba(255,255,255,.12);
-      --text: rgba(255,255,255,.92);
-      --muted: rgba(255,255,255,.62);
-      --shadow: 0 28px 80px rgba(0,0,0,.55);
-      --shadow2: 0 10px 30px rgba(0,0,0,.35);
-      --blue:#3b82f6;
-      --pink:#ff2d6f;
-      --green:#22c55e;
-      --amber:#fbbf24;
-      --radius: 22px;
-      --radius2: 16px;
-      --ring: rgba(59,130,246,.35);
-      --bgimg: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20width%3D%271600%27%20height%3D%27900%27%20viewBox%3D%270%200%201600%20900%27%3E%0A%3Cdefs%3E%0A%20%20%3ClinearGradient%20id%3D%27g%27%20x1%3D%270%27%20y1%3D%270%27%20x2%3D%271%27%20y2%3D%271%27%3E%0A%20%20%20%20%3Cstop%20offset%3D%270%27%20stop-color%3D%27%230b0f1a%27/%3E%0A%20%20%20%20%3Cstop%20offset%3D%271%27%20stop-color%3D%27%230a1024%27/%3E%0A%20%20%3C/linearGradient%3E%0A%20%20%3Cfilter%20id%3D%27n%27%3E%0A%20%20%20%20%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%27.8%27%20numOctaves%3D%273%27%20stitchTiles%3D%27stitch%27/%3E%0A%20%20%20%20%3CfeColorMatrix%20type%3D%27saturate%27%20values%3D%27.1%27/%3E%0A%20%20%20%20%3CfeComponentTransfer%3E%0A%20%20%20%20%20%20%3CfeFuncA%20type%3D%27table%27%20tableValues%3D%270%200.18%27/%3E%0A%20%20%20%20%3C/feComponentTransfer%3E%0A%20%20%3C/filter%3E%0A%3C/defs%3E%0A%3Crect%20width%3D%271600%27%20height%3D%27900%27%20fill%3D%27url%28%23g%29%27/%3E%0A%3Cg%20opacity%3D%27.55%27%3E%0A%20%20%3Cg%20fill%3D%27%23111a33%27%3E%0A%20%20%20%20%3Crect%20x%3D%27120%27%20y%3D%27150%27%20width%3D%27260%27%20height%3D%27600%27%20rx%3D%2722%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27420%27%20y%3D%27120%27%20width%3D%27280%27%20height%3D%27660%27%20rx%3D%2722%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27740%27%20y%3D%27160%27%20width%3D%27260%27%20height%3D%27590%27%20rx%3D%2722%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271040%27%20y%3D%27130%27%20width%3D%27300%27%20height%3D%27640%27%20rx%3D%2722%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.75%27%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27190%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27248%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27306%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27364%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27422%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27480%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27538%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27596%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27654%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.7%27%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27170%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27228%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27286%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27344%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27402%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27460%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27518%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27576%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27634%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27692%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.65%27%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27200%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27258%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27316%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27374%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27432%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27490%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27548%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27606%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.62%27%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27180%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27238%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27296%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27354%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27412%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27470%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27528%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27586%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27644%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27214%27%20r%3D%275%27%20fill%3D%27%2334d399%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27272%27%20r%3D%275%27%20fill%3D%27%2360a5fa%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27330%27%20r%3D%275%27%20fill%3D%27%23f472b6%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27388%27%20r%3D%275%27%20fill%3D%27%23fbbf24%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27446%27%20r%3D%275%27%20fill%3D%27%2334d399%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27504%27%20r%3D%275%27%20fill%3D%27%2360a5fa%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27562%27%20r%3D%275%27%20fill%3D%27%23f472b6%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27620%27%20r%3D%275%27%20fill%3D%27%23fbbf24%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27678%27%20r%3D%275%27%20fill%3D%27%2334d399%27/%3E%0A%20%20%3C/g%3E%0A%3C/g%3E%0A%3Crect%20width%3D%271600%27%20height%3D%27900%27%20filter%3D%27url%28%23n%29%27%20opacity%3D%27.35%27/%3E%0A%3C/svg%3E");
-      --glass: blur(16px);
+    * { box-sizing:border-box; }
+
+    :root {
+      --bg-overlay: rgba(2,6,23,0.90);
+      --card-bg: rgba(15,23,42,0.92);
+      --card-border: rgba(148,163,184,0.35);
+      --text-main: #e5e7eb;
+      --text-muted: #9ca3af;
+      --accent: #22c55e;
+      --accent-alt: #2563eb;
+      --danger: #f97316;
     }
-    *{box-sizing:border-box}
-    html,body{height:100%}
-    body{
+
+    body {
       margin:0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-      color:var(--text);
-      background:
-        radial-gradient(1200px 600px at 15% 20%, rgba(59,130,246,.22), transparent 55%),
-        radial-gradient(900px 500px at 70% 10%, rgba(255,45,111,.18), transparent 55%),
-        radial-gradient(1000px 700px at 60% 80%, rgba(34,197,94,.10), transparent 60%),
-        linear-gradient(180deg, var(--bg0), var(--bg1));
-      position:relative;
-      overflow:hidden;
-    }
-    body::before{
-      content:"";
-      position:fixed; inset:0;
-      background-image: var(--bgimg);
+      min-height:100vh;
+      font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      color: var(--text-main);
+      background-image:
+        linear-gradient(120deg, rgba(15,23,42,0.92), rgba(15,23,42,0.96)),
+        url("https://images.pexels.com/photos/325229/pexels-photo-325229.jpeg?auto=compress&cs=tinysrgb&w=1600");
       background-size: cover;
       background-position: center;
-      opacity:.35;
-      transform: scale(1.03);
-      filter: saturate(.95) contrast(1.05);
-      pointer-events:none;
+      background-attachment: fixed;
     }
-    body::after{
-      content:"";
-      position:fixed; inset:-2px;
-      background: linear-gradient(180deg, rgba(7,9,20,.84), rgba(10,16,36,.88));
-      pointer-events:none;
+
+    .page {
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:24px;
+      background: radial-gradient(circle at top left, rgba(37,99,235,0.30), transparent 55%);
     }
-    .wrap{
+
+    .shell {
+      width:100%;
+      max-width:980px;
+      display:grid;
+      grid-template-columns: minmax(0,1.2fr) minmax(0,1fr);
+      gap:28px;
+    }
+
+    .hero-card,
+    .form-card {
       position:relative;
-      min-height:100%;
-      display:grid;
-      place-items:center;
-      padding: 28px 18px;
-    }
-    .card{
-      width:min(980px, 100%);
-      display:grid;
-      grid-template-columns: 1.05fr .95fr;
-      gap: 18px;
-      padding: 18px;
-      border-radius: calc(var(--radius) + 6px);
-      background: rgba(15, 18, 32, .46);
-      border: 1px solid var(--stroke);
-      box-shadow: var(--shadow);
-      backdrop-filter: var(--glass);
-      -webkit-backdrop-filter: var(--glass);
-    }
-    .hero{
-      border-radius: var(--radius);
-      padding: 28px;
+      border-radius:22px;
+      padding:22px 24px;
+      border:1px solid var(--card-border);
       background:
-        radial-gradient(800px 420px at 20% 20%, rgba(59,130,246,.35), transparent 60%),
-        radial-gradient(700px 420px at 70% 10%, rgba(255,45,111,.28), transparent 55%),
-        radial-gradient(700px 420px at 30% 90%, rgba(34,197,94,.12), transparent 60%),
-        rgba(255,255,255,.03);
-      border: 1px solid rgba(255,255,255,.08);
-      box-shadow: var(--shadow2);
-      overflow:hidden;
-      position:relative;
-      min-height: 320px;
+        linear-gradient(135deg, rgba(15,23,42,0.98), rgba(15,23,42,0.96));
+      box-shadow:
+        0 18px 40px rgba(0,0,0,0.75),
+        0 0 0 1px rgba(15,23,42,0.9);
+      backdrop-filter: blur(4px);
     }
-    .brand{
-      display:flex; align-items:center; gap:12px;
-      font-weight:700;
-      letter-spacing:.2px;
-      margin-bottom: 16px;
-      opacity:.98;
-    }
-    .logo{
-      width:42px; height:42px; border-radius:14px;
-      background: linear-gradient(135deg, rgba(59,130,246,.9), rgba(255,45,111,.9));
-      box-shadow: 0 18px 44px rgba(0,0,0,.35);
-      position:relative;
-      overflow:hidden;
-    }
-    .logo::after{
+
+    .hero-card::before {
       content:"";
-      position:absolute; inset:-30%;
-      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,.55), transparent 55%);
-      transform: rotate(20deg);
-      opacity:.55;
+      position:absolute;
+      inset:-1px;
+      border-radius:inherit;
+      background:
+        radial-gradient(circle at top left, rgba(59,130,246,0.40), transparent 60%),
+        radial-gradient(circle at top right, rgba(236,72,153,0.40), transparent 60%);
+      mix-blend-mode: screen;
+      opacity:0.6;
+      pointer-events:none;
+      z-index:-1;
     }
-    .hero h1{margin: 10px 0 8px; font-size: 28px; line-height:1.15}
-    .hero p{margin:0; color:var(--muted); font-size: 14.5px; line-height:1.55; max-width: 46ch}
-    .chips{margin-top: 18px; display:flex; flex-wrap:wrap; gap:10px}
-    .chip{
-      display:inline-flex; align-items:center; gap:8px;
-      padding: 10px 12px;
-      border-radius: 999px;
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.04);
-      color: rgba(255,255,255,.78);
-      font-size: 13px;
+
+    .badge {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:6px 12px;
+      border-radius:999px;
+      font-size:12px;
+      color:#e5e7eb;
+      background: radial-gradient(circle at top left,#4f46e5,#22c55e);
+      box-shadow:0 12px 30px rgba(59,130,246,0.75);
     }
-    .dot{width:10px; height:10px; border-radius:999px; background: var(--green); box-shadow: 0 0 0 4px rgba(34,197,94,.14)}
-    .dot.blue{background: var(--blue); box-shadow: 0 0 0 4px rgba(59,130,246,.14)}
-    .dot.pink{background: var(--pink); box-shadow: 0 0 0 4px rgba(255,45,111,.14)}
-    .form{
-      border-radius: var(--radius);
-      padding: 26px;
-      background: rgba(255,255,255,.03);
-      border: 1px solid rgba(255,255,255,.08);
-      box-shadow: var(--shadow2);
-      position:relative;
+    .badge-dot {
+      width:8px;
+      height:8px;
+      border-radius:999px;
+      background:#22c55e;
+      box-shadow:0 0 0 4px rgba(34,197,94,0.35);
     }
-    .form h2{margin:0 0 8px; font-size: 18px}
-    .form .sub{margin:0 0 16px; color:var(--muted); font-size: 13.5px}
-    .field{margin: 12px 0}
-    label{display:block; font-size: 12.5px; color: rgba(255,255,255,.72); margin: 0 0 7px 2px}
-    input{
+
+    .hero-title {
+      margin:10px 0 6px;
+      font-size:26px;
+      font-weight:650;
+    }
+    .hero-subtitle {
+      font-size:14px;
+      color:var(--text-muted);
+      max-width:360px;
+    }
+
+    .hero-tags {
+      display:flex;
+      flex-wrap:wrap;
+      gap:8px;
+      margin-top:18px;
+    }
+    .hero-tag {
+      font-size:11px;
+      padding:6px 10px;
+      border-radius:999px;
+      border:1px solid rgba(148,163,184,0.5);
+      background:rgba(15,23,42,0.92);
+    }
+    .hero-metrics {
+      display:flex;
+      gap:16px;
+      margin-top:22px;
+      font-size:12px;
+    }
+    .hero-metric-label { color:var(--text-muted); }
+    .hero-metric-value { font-size:18px; font-weight:600; }
+
+    .form-card h2 {
+      margin:0 0 6px;
+      font-size:18px;
+    }
+    .form-subtitle {
+      font-size:13px;
+      color:var(--text-muted);
+      margin-bottom:16px;
+    }
+    .field {
+      margin-bottom:14px;
+    }
+    label {
+      display:block;
+      font-size:12px;
+      margin-bottom:6px;
+      color:var(--text-muted);
+    }
+    input {
       width:100%;
-      padding: 12px 14px;
-      border-radius: 14px;
-      background: rgba(10, 12, 22, .55);
-      border: 1px solid rgba(255,255,255,.10);
-      color: var(--text);
+      border-radius:999px;
+      border:1px solid rgba(148,163,184,0.4);
+      background:rgba(15,23,42,0.98);
+      color:var(--text-main);
+      padding:9px 14px;
+      font-size:14px;
       outline:none;
-      transition: border-color .2s, box-shadow .2s, transform .05s;
     }
-    input:focus{
-      border-color: rgba(59,130,246,.45);
-      box-shadow: 0 0 0 6px rgba(59,130,246,.14);
+    input::placeholder {
+      color:#6b7280;
     }
-    .btn{
+    input:focus {
+      border-color:var(--accent-alt);
+      box-shadow:0 0 0 1px rgba(37,99,235,0.55);
+    }
+
+    .btn {
+      margin-top:6px;
       width:100%;
-      margin-top: 10px;
-      padding: 12px 14px;
-      border:0;
-      border-radius: 999px;
+      border:none;
+      border-radius:999px;
+      padding:10px 0;
+      font-size:14px;
+      font-weight:600;
+      letter-spacing:.03em;
+      text-transform:uppercase;
       cursor:pointer;
-      color: white;
-      font-weight:700;
-      letter-spacing:.2px;
-      background: linear-gradient(90deg, rgba(34,197,94,.95), rgba(34,197,94,.82));
-      box-shadow: 0 20px 50px rgba(34,197,94,.18);
-      transition: transform .08s ease, filter .15s ease;
+      color:#f9fafb;
+      background:linear-gradient(135deg,#16a34a,#22c55e);
+      box-shadow:0 14px 40px rgba(22,163,74,0.9);
+      transition:transform .08s ease, box-shadow .08s ease, filter .08s ease;
     }
-    .btn:hover{filter: brightness(1.03)}
-    .btn:active{transform: translateY(1px)}
-    .error{
-      margin-top: 12px;
-      padding: 10px 12px;
-      border-radius: 14px;
-      border: 1px solid rgba(255,45,111,.28);
-      background: rgba(255,45,111,.12);
-      color: rgba(255,255,255,.88);
-      font-size: 13px;
+    .btn:hover {
+      filter:brightness(1.05);
+      transform:translateY(-1px);
+      box-shadow:0 18px 55px rgba(22,163,74,1);
     }
-    .foot{margin-top: 14px; text-align:center; color: rgba(255,255,255,.45); font-size: 12.5px}
-    @media (max-width: 860px){
-      .card{grid-template-columns: 1fr;}
-      .hero{min-height: 260px}
+
+    .error {
+      margin-top:10px;
+      font-size:13px;
+      color:var(--danger);
+    }
+
+    .footer {
+      margin-top:18px;
+      font-size:11px;
+      color:var(--text-muted);
+      text-align:center;
+    }
+
+    @media (max-width: 900px) {
+      .shell {
+        grid-template-columns: minmax(0,1fr);
+      }
+      .hero-card {
+        display:none;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <div class="hero">
-        <div class="brand">
-          <div class="logo" aria-hidden="true"></div>
-          <div>{{ title }}</div>
+  <div class="page">
+    <div class="shell">
+      <section class="hero-card">
+        <div class="badge">
+          <span class="badge-dot"></span>
+          Proxy Panel
         </div>
-        <h1>Dashboard Proxy Panel</h1>
-        <p>Interface moderne, rapide et lisible. Connexion sécurisée, gestion centralisée et monitoring des proxies.</p>
-        <div class="chips">
-          <div class="chip"><span class="dot"></span> Sessions</div>
-          <div class="chip"><span class="dot blue"></span> Monitoring</div>
-          <div class="chip"><span class="dot pink"></span> Exports</div>
+        <h1 class="hero-title">Dashboard Proxy Panel</h1>
+        <p class="hero-subtitle">
+          Interface moderne, rapide et lisible. Connexion sécurisée,
+          gestion centralisée et monitoring de tes proxys.
+        </p>
+        <div class="hero-tags">
+          <div class="hero-tag">Sessions</div>
+          <div class="hero-tag">Monitoring</div>
+          <div class="hero-tag">Exports</div>
         </div>
-      </div>
+        <div class="hero-metrics">
+          <div>
+            <div class="hero-metric-label">Source</div>
+            <div class="hero-metric-value">Fichier local</div>
+          </div>
+          <div>
+            <div class="hero-metric-label">Sécurité</div>
+            <div class="hero-metric-value">Authentifiée</div>
+          </div>
+        </div>
+      </section>
 
-      <div class="form">
+      <section class="form-card">
         <h2>Connexion</h2>
-        <p class="sub">Entre tes identifiants pour accéder au panel.</p>
-
-        <form method="post" autocomplete="on">
+        <p class="form-subtitle">
+          Entre tes identifiants pour accéder au panel.
+        </p>
+        <form method="post">
           <div class="field">
-            <label>Nom d’utilisateur</label>
-            <input type="text" name="username" value="{{ default_user }}" autocomplete="username" required>
+            <label for="username">Nom d'utilisateur</label>
+            <input id="username" name="username" autocomplete="username" value="{{ default_user }}">
           </div>
           <div class="field">
-            <label>Mot de passe</label>
-            <input type="password" name="password" autocomplete="current-password" required>
+            <label for="password">Mot de passe</label>
+            <input id="password" name="password" type="password" autocomplete="current-password">
           </div>
+          {% if error %}
+          <div class="error">{{ error }}</div>
+          {% endif %}
           <button class="btn" type="submit">Se connecter</button>
         </form>
-
-        {% if error %}
-          <div class="error">{{ error }}</div>
-        {% endif %}
-
-        <div class="foot">© {{ title }} · Secure Panel</div>
-      </div>
+        <div class="footer">
+          © {{ title }} · Secure Panel
+        </div>
+      </section>
     </div>
   </div>
 </body>
@@ -466,238 +521,393 @@ LOGIN_TEMPLATE = """<!doctype html>
 """
 
 # ---- LAYOUT : thème dashboard corporate ----
-LAYOUT_TEMPLATE = """{% macro nav_link(href, label, active_name) -%}
-  <a href="{{ href }}" class="nav-item {{ 'is-active' if active == active_name else '' }}">{{ label }}</a>
+LAYOUT_TEMPLATE = """
+{% macro nav_link(href, label, active_name) -%}
+  <a href="{{ href }}" class="nav-link {{ 'active' if active == active_name else '' }}">{{ label }}</a>
 {%- endmacro %}
+
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>{{ title }} · {{ page_title }}</title>
+  <title>{{ title }} - {{ page_title }}</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
-    :root{
-      --bg0:#070914;
-      --bg1:#0a1024;
-      --panel: rgba(20, 24, 40, .60);
-      --panel2: rgba(20, 24, 40, .42);
-      --stroke: rgba(255,255,255,.08);
-      --stroke2: rgba(255,255,255,.12);
-      --text: rgba(255,255,255,.92);
-      --muted: rgba(255,255,255,.62);
-      --shadow: 0 28px 80px rgba(0,0,0,.55);
-      --shadow2: 0 10px 30px rgba(0,0,0,.35);
-      --blue:#3b82f6;
-      --pink:#ff2d6f;
-      --green:#22c55e;
-      --amber:#fbbf24;
-      --radius: 22px;
-      --radius2: 16px;
-      --glass: blur(16px);
-      --bgimg: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20width%3D%271600%27%20height%3D%27900%27%20viewBox%3D%270%200%201600%20900%27%3E%0A%3Cdefs%3E%0A%20%20%3ClinearGradient%20id%3D%27g%27%20x1%3D%270%27%20y1%3D%270%27%20x2%3D%271%27%20y2%3D%271%27%3E%0A%20%20%20%20%3Cstop%20offset%3D%270%27%20stop-color%3D%27%230b0f1a%27/%3E%0A%20%20%20%20%3Cstop%20offset%3D%271%27%20stop-color%3D%27%230a1024%27/%3E%0A%20%20%3C/linearGradient%3E%0A%20%20%3Cfilter%20id%3D%27n%27%3E%0A%20%20%20%20%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%27.8%27%20numOctaves%3D%273%27%20stitchTiles%3D%27stitch%27/%3E%0A%20%20%20%20%3CfeColorMatrix%20type%3D%27saturate%27%20values%3D%27.1%27/%3E%0A%20%20%20%20%3CfeComponentTransfer%3E%0A%20%20%20%20%20%20%3CfeFuncA%20type%3D%27table%27%20tableValues%3D%270%200.18%27/%3E%0A%20%20%20%20%3C/feComponentTransfer%3E%0A%20%20%3C/filter%3E%0A%3C/defs%3E%0A%3Crect%20width%3D%271600%27%20height%3D%27900%27%20fill%3D%27url%28%23g%29%27/%3E%0A%3Cg%20opacity%3D%27.55%27%3E%0A%20%20%3Cg%20fill%3D%27%23111a33%27%3E%0A%20%20%20%20%3Crect%20x%3D%27120%27%20y%3D%27150%27%20width%3D%27260%27%20height%3D%27600%27%20rx%3D%2722%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27420%27%20y%3D%27120%27%20width%3D%27280%27%20height%3D%27660%27%20rx%3D%2722%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27740%27%20y%3D%27160%27%20width%3D%27260%27%20height%3D%27590%27%20rx%3D%2722%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271040%27%20y%3D%27130%27%20width%3D%27300%27%20height%3D%27640%27%20rx%3D%2722%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.75%27%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27190%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27248%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27306%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27364%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27422%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27480%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27538%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27596%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27150%27%20y%3D%27654%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.7%27%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27170%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27228%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27286%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27344%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27402%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27460%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27518%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27576%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27634%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27460%27%20y%3D%27692%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.65%27%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27200%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27258%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27316%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27374%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27432%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27490%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27548%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%27770%27%20y%3D%27606%27%20width%3D%27200%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%20fill%3D%27%231b2750%27%20opacity%3D%27.62%27%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27180%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27238%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27296%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27354%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27412%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27470%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27528%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27586%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%20%20%3Crect%20x%3D%271080%27%20y%3D%27644%27%20width%3D%27220%27%20height%3D%2734%27%20rx%3D%2710%27/%3E%0A%20%20%3C/g%3E%0A%20%20%3Cg%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27214%27%20r%3D%275%27%20fill%3D%27%2334d399%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27272%27%20r%3D%275%27%20fill%3D%27%2360a5fa%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27330%27%20r%3D%275%27%20fill%3D%27%23f472b6%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27388%27%20r%3D%275%27%20fill%3D%27%23fbbf24%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27446%27%20r%3D%275%27%20fill%3D%27%2334d399%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27504%27%20r%3D%275%27%20fill%3D%27%2360a5fa%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27562%27%20r%3D%275%27%20fill%3D%27%23f472b6%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27620%27%20r%3D%275%27%20fill%3D%27%23fbbf24%27/%3E%0A%20%20%20%20%3Ccircle%20cx%3D%27310%27%20cy%3D%27678%27%20r%3D%275%27%20fill%3D%27%2334d399%27/%3E%0A%20%20%3C/g%3E%0A%3C/g%3E%0A%3Crect%20width%3D%271600%27%20height%3D%27900%27%20filter%3D%27url%28%23n%29%27%20opacity%3D%27.35%27/%3E%0A%3C/svg%3E");
+    :root {
+      --bg-main: #020617;
+      --bg-elevated: #020617;
+      --text-main: #e5e7eb;
+      --text-muted: #9ca3af;
+      --accent-primary: #2563eb;
+      --accent-primary-soft: rgba(37,99,235,0.18);
+      --accent-secondary: #38bdf8;
+      --accent-ok: #22c55e;
+      --accent-fail: #f97316;
+      --accent-warn: #eab308;
     }
-    *{box-sizing:border-box}
-    html,body{height:100%}
-    body{
+    * { box-sizing:border-box; }
+    body {
       margin:0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-      color:var(--text);
-      background:
-        radial-gradient(1200px 600px at 15% 20%, rgba(59,130,246,.22), transparent 55%),
-        radial-gradient(900px 500px at 70% 10%, rgba(255,45,111,.18), transparent 55%),
-        radial-gradient(1000px 700px at 60% 80%, rgba(34,197,94,.10), transparent 60%),
-        linear-gradient(180deg, var(--bg0), var(--bg1));
-      min-height:100%;
-      position:relative;
-      overflow-x:hidden;
-    }
-    body::before{
-      content:"";
-      position:fixed; inset:0;
-      background-image: var(--bgimg);
+      font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      background-image:
+        linear-gradient(140deg, rgba(15,23,42,0.94), rgba(15,23,42,0.96)),
+        url("https://images.pexels.com/photos/325229/pexels-photo-325229.jpeg?auto=compress&cs=tinysrgb&w=1600");
       background-size: cover;
       background-position: center;
-      opacity:.22;
-      transform: scale(1.03);
-      filter: saturate(.95) contrast(1.05);
-      pointer-events:none;
+      background-attachment: fixed;
+      color:var(--text-main);
+      min-height:100vh;
     }
-    body::after{
+    .shell {
+      max-width:1120px;
+      margin:20px auto 32px;
+      padding:18px 20px 30px;
+      border-radius:22px;
+      background:
+        radial-gradient(circle at top left, rgba(37,99,235,0.18), transparent 58%),
+        radial-gradient(circle at bottom right, rgba(56,189,248,0.12), transparent 60%),
+        linear-gradient(130deg, rgba(15,23,42,0.96), rgba(15,23,42,0.98));
+      border:1px solid rgba(148,163,184,0.4);
+      box-shadow:
+        0 18px 60px rgba(0,0,0,0.9),
+        0 0 0 1px rgba(15,23,42,0.9);
+      backdrop-filter: blur(10px);
+    }
+    header {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      margin-bottom:18px;
+    }
+    .brand {
+      display:flex;
+      flex-direction:column;
+      gap:2px;
+    }
+    .brand-title {
+      font-weight:700;
+      letter-spacing:.2em;
+      font-size:12px;
+      text-transform:uppercase;
+    }
+    .brand-title span {
+      color:#60a5fa;
+    }
+    .brand-sub {
+      font-size:11px;
+      color:var(--text-muted);
+    }
+    nav {
+      display:flex;
+      gap:10px;
+      align-items:center;
+      font-size:13px;
+    }
+    .nav-link {
+      position:relative;
+      padding:7px 14px;
+      border-radius:999px;
+      text-decoration:none;
+      color:#e5e7eb;
+      border:1px solid transparent;
+      background:rgba(15,23,42,0.6);
+    }
+    .nav-link::before {
       content:"";
-      position:fixed; inset:-2px;
-      background: linear-gradient(180deg, rgba(7,9,20,.82), rgba(10,16,36,.90));
-      pointer-events:none;
+      position:absolute;
+      inset:0;
+      border-radius:999px;
+      background:radial-gradient(circle at top left, rgba(59,130,246,0.3), transparent 60%);
+      opacity:0;
+      transition:opacity .15s ease;
+      z-index:-1;
     }
-    a{color:inherit; text-decoration:none}
-    .container{position:relative; width:min(1280px, 100%); margin: 0 auto; padding: 18px 16px 40px;}
-    /* Top Bar */
-    .topbar{
-      position:sticky; top:0; z-index:50;
-      padding: 14px 16px;
-      margin: 12px 0 18px;
-      border-radius: calc(var(--radius) + 6px);
-      background: rgba(15, 18, 32, .46);
-      border: 1px solid var(--stroke);
-      box-shadow: var(--shadow2);
-      backdrop-filter: var(--glass);
-      -webkit-backdrop-filter: var(--glass);
-      display:flex; align-items:center; gap: 14px;
+    .nav-link:hover::before {
+      opacity:1;
     }
-    .brand{display:flex; align-items:center; gap:12px; min-width: 190px}
-    .logo{width:42px; height:42px; border-radius:14px;
-      background: linear-gradient(135deg, rgba(59,130,246,.9), rgba(255,45,111,.9));
-      box-shadow: 0 18px 44px rgba(0,0,0,.35);
-      position:relative; overflow:hidden;
+    .nav-link.active {
+      border-color:rgba(59,130,246,0.9);
+      background:radial-gradient(circle at top left, rgba(59,130,246,0.45), transparent 62%);
+      box-shadow:0 12px 30px rgba(59,130,246,0.6);
     }
-    .logo::after{content:""; position:absolute; inset:-30%;
-      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,.55), transparent 55%);
-      transform: rotate(20deg); opacity:.55;
+    .logout-link {
+      margin-left:6px;
+      padding:6px 12px;
+      border-radius:999px;
+      font-size:12px;
+      border:1px solid rgba(148,163,184,0.4);
+      color:var(--text-muted);
+      text-decoration:none;
+      background:rgba(15,23,42,0.8);
     }
-    .brandname{font-weight:800; letter-spacing:.2px}
-    .navpill{
-      display:flex; align-items:center; gap: 6px;
-      padding: 6px;
-      border-radius: 999px;
-      background: rgba(255,255,255,.03);
-      border: 1px solid rgba(255,255,255,.08);
-      margin-left: 8px;
-      flex: 1 1 auto;
-      max-width: 520px;
+    .logout-link:hover {
+      color:#f9fafb;
+      border-color:rgba(248,250,252,0.4);
     }
-    .nav-item{
-      padding: 10px 14px;
-      border-radius: 999px;
-      color: rgba(255,255,255,.68);
-      font-weight: 650;
-      font-size: 13.5px;
-      transition: background .15s, color .15s;
-      white-space:nowrap;
+
+    h2 {
+      margin:0 0 14px;
+      font-size:20px;
     }
-    .nav-item:hover{background: rgba(255,255,255,.05); color: rgba(255,255,255,.86)}
-    .nav-item.is-active{
-      background: rgba(255,255,255,.08);
-      color: rgba(255,255,255,.92);
-      border: 1px solid rgba(255,255,255,.10);
+
+    .grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+      gap:14px;
+      margin-bottom:18px;
     }
-    .right{display:flex; align-items:center; gap:10px; margin-left:auto}
-    .chip{
-      display:inline-flex; align-items:center; gap:8px;
-      padding: 10px 12px;
-      border-radius: 999px;
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.04);
-      color: rgba(255,255,255,.78);
-      font-size: 13px;
+    .card {
+      background:
+        radial-gradient(circle at top left, rgba(37,99,235,0.10), transparent 55%),
+        linear-gradient(to bottom right, #020617, #020617);
+      border-radius:16px;
+      padding:16px 18px;
+      border:1px solid rgba(148,163,184,0.32);
+      box-shadow:0 20px 60px rgba(15,23,42,1);
     }
-    .dot{width:10px; height:10px; border-radius:999px; background: var(--green); box-shadow: 0 0 0 4px rgba(34,197,94,.14)}
-    /* Cards & tables */
-    .grid{display:grid; gap: 16px}
-    .card{
-      background: var(--panel);
-      border: 1px solid var(--stroke);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow2);
-      backdrop-filter: var(--glass);
-      -webkit-backdrop-filter: var(--glass);
-      overflow:hidden;
+    .card h3 {
+      margin:0 0 6px;
+      font-size:14px;
+      color:#e5e7eb;
     }
-    .card .card-hd{
-      padding: 14px 16px;
-      display:flex; align-items:center; justify-content:space-between;
-      border-bottom: 1px solid rgba(255,255,255,.06);
+    .card .big {
+      font-size:28px;
+      font-weight:600;
     }
-    .card .card-hd h3{margin:0; font-size: 13px; letter-spacing:.2px; color: rgba(255,255,255,.78); font-weight:800; text-transform: none}
-    .card .card-bd{padding: 16px}
-    .btn{
-      display:inline-flex; align-items:center; justify-content:center;
-      padding: 10px 14px;
-      border-radius: 999px;
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.04);
-      color: rgba(255,255,255,.90);
-      font-weight: 750;
-      cursor:pointer;
-      transition: transform .08s ease, filter .15s ease, background .15s ease;
-      user-select:none;
+    .muted {
+      color:var(--text-muted);
+      font-size:12px;
     }
-    .btn:hover{background: rgba(255,255,255,.06)}
-    .btn:active{transform: translateY(1px)}
-    .btn.primary{
-      border:0;
-      background: linear-gradient(90deg, rgba(34,197,94,.95), rgba(34,197,94,.82));
-      box-shadow: 0 20px 50px rgba(34,197,94,.18);
+    .pill {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:4px 9px;
+      border-radius:999px;
+      border:1px solid rgba(148,163,184,0.4);
+      font-size:11px;
     }
-    .btn.primary:hover{filter: brightness(1.03)}
-    .pill{
-      display:inline-flex; align-items:center; gap:8px;
-      padding: 8px 10px;
-      border-radius: 999px;
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.04);
-      font-size: 12.5px;
-      color: rgba(255,255,255,.72);
+    .pill-dot {
+      width:8px;
+      height:8px;
+      border-radius:999px;
     }
-    .pill .dot{width:9px; height:9px; box-shadow:none}
-    .pill.ok .dot{background: var(--green)}
-    .pill.warn .dot{background: var(--amber)}
-    .pill.bad .dot{background: var(--pink)}
-    /* Form elements */
-    input, select, textarea{
+
+    table {
       width:100%;
-      padding: 11px 12px;
-      border-radius: 14px;
-      background: rgba(10, 12, 22, .55);
-      border: 1px solid rgba(255,255,255,.10);
-      color: var(--text);
+      border-collapse:collapse;
+      font-size:13px;
+    }
+    th, td {
+      padding:8px 10px;
+      text-align:left;
+      border-bottom:1px solid rgba(30,41,59,0.9);
+    }
+    th {
+      font-size:12px;
+      color:var(--text-muted);
+      text-transform:uppercase;
+      letter-spacing:.05em;
+      background:rgba(15,23,42,0.95);
+      position:sticky;
+      top:0;
+      z-index:1;
+    }
+    tr:nth-child(even) td {
+      background:rgba(15,23,42,0.85);
+    }
+    tr:hover td {
+      background:rgba(15,23,42,1);
+    }
+
+    .badge {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      padding:4px 9px;
+      border-radius:999px;
+      font-size:11px;
+      background:rgba(15,23,42,0.95);
+      border:1px solid rgba(148,163,184,0.4);
+    }
+    .status-dot {
+      width:8px;
+      height:8px;
+      border-radius:999px;
+    }
+    .status-ok {
+      background:#22c55e;
+      box-shadow:0 0 0 4px rgba(34,197,94,0.4);
+    }
+    .status-fail {
+      background:#f97316;
+      box-shadow:0 0 0 4px rgba(248,113,113,0.35);
+    }
+
+    .btn {
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:6px;
+      font-size:13px;
+      border-radius:999px;
+      border:1px solid transparent;
+      padding:6px 12px;
+      cursor:pointer;
+      text-decoration:none;
+      background:linear-gradient(135deg,#2563eb,#22c55e);
+      color:#f9fafb;
+      box-shadow:0 14px 38px rgba(37,99,235,0.65);
+    }
+    .btn-secondary {
+      background:rgba(15,23,42,0.95);
+      border-color:rgba(148,163,184,0.4);
+      box-shadow:none;
+      color:var(--text-main);
+    }
+    .btn-danger {
+      background:linear-gradient(135deg,#b91c1c,#f97316);
+      box-shadow:0 14px 38px rgba(185,28,28,0.75);
+    }
+
+    .btn-small {
+      padding:4px 9px;
+      font-size:12px;
+    }
+
+    .table-actions {
+      display:flex;
+      gap:6px;
+    }
+
+    .form-row {
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+      margin-bottom:12px;
+      align-items:flex-end;
+    }
+    .form-row label {
+      display:block;
+      font-size:12px;
+      color:var(--text-muted);
+      margin-bottom:4px;
+    }
+    .form-row input,
+    .form-row select {
+      border-radius:999px;
+      border:1px solid rgba(148,163,184,0.4);
+      background:rgba(15,23,42,0.98);
+      color:#e5e7eb;
+      padding:7px 10px;
+      min-width:120px;
+      font-size:13px;
+    }
+    .form-row input:focus,
+    .form-row select:focus {
       outline:none;
+      border-color:var(--accent-primary);
+      box-shadow:0 0 0 1px rgba(37,99,235,0.5);
     }
-    input:focus, select:focus, textarea:focus{
-      border-color: rgba(59,130,246,.45);
-      box-shadow: 0 0 0 6px rgba(59,130,246,.14);
+
+    .error-msg {
+      color:var(--accent-fail);
+      font-size:12px;
+      margin-top:4px;
     }
-    table{width:100%; border-collapse:separate; border-spacing:0 10px}
-    thead th{text-align:left; font-size: 12px; color: rgba(255,255,255,.55); font-weight:800; padding: 0 10px 2px}
-    tbody tr{background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06)}
-    tbody td{padding: 12px 10px; font-size: 13px; color: rgba(255,255,255,.78)}
-    tbody tr td:first-child{border-top-left-radius: 14px; border-bottom-left-radius: 14px}
-    tbody tr td:last-child{border-top-right-radius: 14px; border-bottom-right-radius: 14px}
-    /* Utility */
-    .muted{color: var(--muted)}
-    .divider{height:1px; background: rgba(255,255,255,.06); margin: 14px 0}
-    @media (max-width: 860px){
-      .topbar{flex-wrap:wrap}
-      .brand{min-width:auto}
-      .navpill{order: 3; width:100%; max-width:none; margin-left:0}
-      .right{width:100%; justify-content:flex-end}
+
+    .footer-note {
+      margin-top:18px;
+      font-size:11px;
+      color:var(--text-muted);
+      text-align:center;
     }
+
+    .progress-wrapper {
+      margin-top:10px;
+      font-size:12px;
+      color:var(--text-muted);
+    }
+    .progress-bar-bg {
+      margin-top:6px;
+      width:100%;
+      height:6px;
+      border-radius:999px;
+      background:rgba(15,23,42,0.9);
+      overflow:hidden;
+      border:1px solid rgba(30,64,175,0.8);
+    }
+    .progress-bar-fill {
+      height:100%;
+      border-radius:999px;
+      background:linear-gradient(90deg,#2563eb,#22c55e);
+    }
+
+    @media (max-width: 768px) {
+      header {
+        flex-direction:column;
+        align-items:flex-start;
+        gap:10px;
+      }
+      nav {
+        flex-wrap:wrap;
+        justify-content:flex-start;
+      }
+      .shell {
+        margin:12px;
+        padding:14px 12px 22px;
+      }
+      th, td {
+        padding:6px 6px;
+      }
+    }
+
+    .pre-proxies {
+      width:100%;
+      min-height:260px;
+      border-radius:16px;
+      border:1px solid rgba(30,64,175,0.8);
+      background:rgba(15,23,42,0.96);
+      padding:10px;
+      color:#e5e7eb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size:12px;
+      resize:vertical;
+    }
+
+    .clipboard-info {
+      margin-top:6px;
+      font-size:11px;
+      color:var(--text-muted);
+    }
+
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="topbar">
+  <div class="shell">
+    <header>
       <div class="brand">
-        <div class="logo" aria-hidden="true"></div>
-        <div class="brandname">{{ title }}</div>
+        <div class="brand-title"><span>{{ title }}</span></div>
+        <div class="brand-sub">Internal proxy management console</div>
       </div>
-
-      <div class="navpill" role="navigation" aria-label="Navigation">
+      <nav>
         {{ nav_link(url_for('dashboard'), 'Dashboard', 'dashboard') }}
-        {{ nav_link(url_for('proxy_plan'), 'Proxy Plan', 'proxy_plan') }}
-        {{ nav_link(url_for('auth_ip'), 'Authenticate IP', 'auth_ip') }}
-      </div>
-
-      <div class="right">
-        <div class="chip"><span class="dot"></span> Online</div>
-        <a class="btn" href="{{ url_for('logout') }}">Logout</a>
-      </div>
-    </div>
+        {{ nav_link(url_for('clients'), 'Clients', 'clients') }}
+        {{ nav_link(url_for('proxies'), 'Proxies', 'proxies') }}
+        {{ nav_link(url_for('settings'), 'Settings', 'settings') }}
+        <a class="logout-link" href="{{ url_for('logout') }}">Logout</a>
+      </nav>
+    </header>
 
     {{ body|safe }}
+
+    <div class="footer-note">
+      Local-only admin panel · Proxy source: {{ stats.proxy_source }} · DB: {{ stats.db_file }}
+    </div>
   </div>
 </body>
 </html>
 """
-
 
 # =============================
 # Routes
@@ -756,12 +966,20 @@ def dashboard():
         <div class="card">
           <h3>Clients</h3>
           <div class="big">{{ stats.clients_count }}</div>
-          <div class="muted">Each client download has its own text file.</div>
+          <div class="muted">Configured clients</div>
         </div>
-        <div class="card">
-          <h3>Pool status</h3>
-          <div class="muted">Master proxy file:<br><code>{{ stats.proxy_source }}</code></div>
-          <div class="muted" style="margin-top:6px;">Database file:<br><code>{{ stats.db_file }}</code></div>
+      </div>
+
+      <div class="progress-wrapper">
+        <div>Usage of proxy pool</div>
+        {% set total = stats.total_proxies if stats.total_proxies > 0 else 1 %}
+        {% set used = stats.assigned_proxies %}
+        {% set pct = (used * 100) // total %}
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" style="width: {{ pct }}%;"></div>
+        </div>
+        <div class="muted" style="margin-top:4px;">
+          {{ used }} / {{ total }} proxies assigned ({{ pct }}%)
         </div>
       </div>
     """, stats=stats)
@@ -769,9 +987,9 @@ def dashboard():
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Dashboard",
-        body=body,
         active="dashboard",
         stats=stats,
+        body=body,
     )
 
 
@@ -788,165 +1006,152 @@ def clients():
         try:
             count = int(count_str)
         except ValueError:
-            count = 0
-
+            count = -1
         if not name:
-            error = "Client name is required."
+            error = "Client name cannot be empty."
         elif count <= 0:
-            error = "Number of proxies must be a positive integer."
+            error = "Proxy count must be a positive integer."
         else:
-            all_proxies = load_proxy_list()
-            assigned = set(db["assigned_proxies"].keys())
-            available = [p for p in all_proxies if p not in assigned]
-
-            if len(available) < count:
-                error = f"Not enough available proxies. Requested {count}, only {len(available)} left."
-            else:
-                selected = available[:count]
-                client_id = next_client_id(db)
-                created_at = datetime.datetime.now().isoformat(timespec="seconds")
-                client = {
-                    "id": client_id,
-                    "name": name,
-                    "count": count,
-                    "proxies": selected,
-                    "created_at": created_at,
-                }
-                db["clients"].append(client)
-                for p in selected:
-                    db["assigned_proxies"][p] = client_id
-                save_db(db)
-
-                filename = f"{name}_{count}proxies.txt"
-                content = "\n".join(selected) + "\n"
-                mem = BytesIO(content.encode("utf-8"))
-                mem.seek(0)
-                return send_file(
-                    mem,
-                    as_attachment=True,
-                    download_name=filename,
-                    mimetype="text/plain",
-                )
-
-    db = get_db()
-    clients_list = sorted(db["clients"], key=lambda c: c["id"])
+            db["clients"][name] = {"count": count}
+            save_db(db)
+            assign_proxies_evenly()
+            return redirect(url_for("clients"))
 
     body = render_template_string("""
       <h2>Clients</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Create new client</h3>
-          <form method="post">
-            <div class="form-row">
-              <div>
-                <label>Client name</label>
-                <input type="text" name="name" placeholder="e.g. Mohamed">
-              </div>
-              <div>
-                <label>Number of proxies</label>
-                <input type="number" name="count" min="1" placeholder="10">
-              </div>
-            </div>
-            {% if error %}
-              <div class="error-msg">{{ error }}</div>
-            {% endif %}
-            <button class="btn" type="submit">Create & download .txt</button>
-            <div class="muted" style="margin-top:8px;">
-              Available proxies: <strong>{{ stats.available_proxies }}</strong>
-            </div>
-          </form>
-        </div>
-
-        <div class="card">
-          <h3>Summary</h3>
-          <div class="muted">
-            Total clients: <strong>{{ stats.clients_count }}</strong><br>
-            Total proxies: <strong>{{ stats.total_proxies }}</strong><br>
-            Assigned: <span style="color:#fed7aa;">{{ stats.assigned_proxies }}</span><br>
-            Available: <span style="color:#bbf7d0;">{{ stats.available_proxies }}</span>
+      {% if error %}
+        <div class="error-msg">{{ error }}</div>
+      {% endif %}
+      <form method="post" style="margin-bottom:14px;">
+        <div class="form-row">
+          <div>
+            <label for="name">Client name</label>
+            <input id="name" name="name" placeholder="Client name">
+          </div>
+          <div>
+            <label for="count">Proxy count</label>
+            <input id="count" name="count" type="number" min="1" placeholder="Example: 10">
+          </div>
+          <div>
+            <button class="btn" type="submit">Add client</button>
           </div>
         </div>
-      </div>
+      </form>
 
-      <div class="card" style="margin-top:16px;">
+      <div class="card">
         <h3>Existing clients</h3>
-        {% if not clients %}
-          <div class="muted">No clients yet.</div>
+        {% if not db.clients %}
+          <div class="muted">No clients configured yet.</div>
         {% else %}
           <table>
             <thead>
               <tr>
-                <th>ID</th>
-                <th>Name</th>
-                <th>Proxies</th>
-                <th>Created</th>
+                <th>Client</th>
+                <th>Proxy count</th>
+                <th>Assigned proxies</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {% for c in clients %}
-                <tr>
-                  <td>#{{ c.id }}</td>
-                  <td>{{ c.name }}</td>
-                  <td>{{ c.count }}</td>
-                  <td>{{ c.created_at }}</td>
-                  <td>
-                    <a class="btn-secondary" href="{{ url_for('download_client', client_id=c.id) }}">Download</a>
-                    <form method="post" action="{{ url_for('delete_client', client_id=c.id) }}" style="display:inline;" onsubmit="return confirm('Delete this client and free its proxies?');">
-                      <button class="btn-secondary" type="submit" style="margin-left:6px;">Delete</button>
-                    </form>
-                  </td>
-                </tr>
-              {% endfor %}
+            {% for name, info in db.clients.items() %}
+              {% set assigned = db.assignments.values()|list %}
+              {% set assigned_count = assigned|select("equalto", name)|list|length %}
+              <tr>
+                <td>{{ name }}</td>
+                <td>{{ info.count }}</td>
+                <td>
+                  <span class="badge">
+                    <span class="status-dot status-ok"></span>
+                    {{ assigned_count }}
+                  </span>
+                </td>
+                <td>
+                  <div class="table-actions">
+                    <a class="btn btn-small btn-secondary" href="{{ url_for('client_proxies_view', client_name=name) }}">View proxies</a>
+                    <a class="btn btn-small btn-secondary" href="{{ url_for('client_proxies_download', client_name=name) }}">Download</a>
+                    <a class="btn btn-small btn-danger" href="{{ url_for('delete_client', client_name=name) }}" onclick="return confirm('Delete this client?');">Delete</a>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
             </tbody>
           </table>
         {% endif %}
       </div>
-    """, stats=stats, clients=clients_list, error=error)
+    """, db=db, error=error)
     return render_template_string(
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Clients",
-        body=body,
         active="clients",
         stats=stats,
+        body=body,
     )
 
 
-@app.route("/clients/<int:client_id>/download")
+@app.route("/clients/<client_name>/proxies")
 @login_required
-def download_client(client_id):
+def client_proxies_view(client_name):
+    stats = compute_stats()
     db = get_db()
-    client = next((c for c in db["clients"] if c["id"] == client_id), None)
-    if not client:
+    if client_name not in db["clients"]:
         abort(404)
-    filename = f"{client['name']}_{client['count']}proxies.txt"
-    content = "\n".join(client["proxies"]) + "\n"
-    mem = BytesIO(content.encode("utf-8"))
-    mem.seek(0)
-    return send_file(
-        mem,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="text/plain",
+    proxies = get_client_proxies(client_name)
+    lines = [p[1] for p in proxies]
+    text_block = "\n".join(lines)
+    body = render_template_string("""
+      <h2>Proxies for client: {{ client_name }}</h2>
+      <div class="card">
+        <h3>Proxy list</h3>
+        <textarea class="pre-proxies" readonly id="proxyText">{{ text_block }}</textarea>
+        <div class="clipboard-info">
+          <button class="btn btn-small" type="button" onclick="copyProxies()">Copy to clipboard</button>
+        </div>
+      </div>
+      <script>
+        function copyProxies() {
+          var el = document.getElementById("proxyText");
+          el.select();
+          document.execCommand("copy");
+          alert("Proxies copied to clipboard.");
+        }
+      </script>
+    """, client_name=client_name, text_block=text_block)
+    return render_template_string(
+        LAYOUT_TEMPLATE,
+        title=APP_TITLE,
+        page_title=f"Client {client_name}",
+        active="clients",
+        stats=stats,
+        body=body,
     )
 
 
-@app.route("/clients/<int:client_id>/delete", methods=["POST"])
+@app.route("/clients/<client_name>/download")
 @login_required
-def delete_client(client_id):
+def client_proxies_download(client_name):
     db = get_db()
-    new_clients = []
-    removed_proxies = []
-    for c in db["clients"]:
-        if c["id"] == client_id:
-            removed_proxies.extend(c.get("proxies", []))
-        else:
-            new_clients.append(c)
-    db["clients"] = new_clients
-    for p in removed_proxies:
-        db["assigned_proxies"].pop(p, None)
-    save_db(db)
+    if client_name not in db["clients"]:
+        abort(404)
+    proxies = get_client_proxies(client_name)
+    lines = [p[1] for p in proxies]
+    text_block = "\n".join(lines)
+
+    tmp_path = f"/tmp/proxies_{client_name}.txt"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text_block)
+    return send_file(tmp_path, as_attachment=True, download_name=f"{client_name}_proxies.txt")
+
+
+@app.route("/clients/<client_name>/delete")
+@login_required
+def delete_client(client_name):
+    db = get_db()
+    if client_name in db["clients"]:
+        del db["clients"][client_name]
+        db["assignments"] = {pid: c for pid, c in db["assignments"].items() if c != client_name}
+        save_db(db)
+        assign_proxies_evenly()
     return redirect(url_for("clients"))
 
 
@@ -954,279 +1159,165 @@ def delete_client(client_id):
 @login_required
 def proxies():
     stats = compute_stats()
-    all_proxies = load_proxy_list()
     db = get_db()
-    assigned_map = db["assigned_proxies"]
-
-    table_data = []
-    for p in all_proxies:
-        client_id = assigned_map.get(p)
-        table_data.append({
-            "proxy": p,
-            "client_id": client_id,
-        })
+    proxies = load_all_proxies()
+    assignments = db["assignments"]
+    rows = []
+    for p in proxies:
+        pid = f"{p['host']}:{p['port']}"
+        client_name = assignments.get(pid)
+        rows.append((pid, build_proxy_url(p), client_name))
 
     body = render_template_string("""
-      <h2>Proxies</h2>
-      <div class="card" style="margin-bottom:16px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-          <div class="muted">
-            Total: <strong>{{ stats.total_proxies }}</strong> ·
-            Available: <span style="color:#bbf7d0;">{{ stats.available_proxies }}</span> ·
-            Assigned: <span style="color:#fed7aa;">{{ stats.assigned_proxies }}</span>
-          </div>
-          <button class="btn" id="check-all-btn">Check ALL Proxies</button>
-        </div>
-        <div class="muted" style="margin-top:4px;font-size:11px;">
-          Performs an HTTPS request to Google using each proxy (timeout {{ timeout }}s).
-        </div>
-
-        <div id="progress-wrapper" class="progress-wrapper" style="display:none;">
-          <div>
-            <span id="progress-label">0%</span>
-            &nbsp;·&nbsp;
-            <span id="progress-detail">Waiting…</span>
-          </div>
-          <div class="progress-bar-outer">
-            <div class="progress-bar-inner" id="progress-bar"></div>
-          </div>
-        </div>
-
-        <div id="check-summary" class="muted" style="margin-top:8px;font-size:12px;display:none;">
-          Last check:
-          <span id="sum-ok" style="color:#bbf7d0;">0 OK</span>
-          &nbsp;·&nbsp;
-          <span id="sum-fail" style="color:#fed7aa;">0 Failed</span>
-        </div>
-      </div>
-
-      <div class="card" style="max-height:480px;overflow:auto;">
-        <table id="proxy-table">
-          <thead>
-            <tr>
-              <th>Proxy</th>
-              <th>Assigned to</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in rows %}
-              <tr data-proxy="{{ row.proxy }}">
-                <td class="proxy-cell"><code>{{ row.proxy }}</code></td>
+      <h2>Proxy pool</h2>
+      <div class="card">
+        {% if not rows %}
+          <div class="muted">No proxies loaded. Configure "proxy_source" in settings.</div>
+        {% else %}
+          <table>
+            <thead>
+              <tr>
+                <th>Proxy ID</th>
+                <th>URL</th>
+                <th>Assigned client</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for pid, url, client_name in rows %}
+              <tr>
+                <td>{{ pid }}</td>
+                <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;">
+                  {{ url }}
+                </td>
                 <td>
-                  {% if row.client_id %}
-                    <span class="pill">Client #{{ row.client_id }}</span>
+                  {% if client_name %}
+                    <span class="badge">
+                      <span class="status-dot status-ok"></span>
+                      {{ client_name }}
+                    </span>
                   {% else %}
-                    <span class="muted">Unassigned</span>
+                    <span class="badge">
+                      <span class="status-dot status-fail"></span>
+                      Unassigned
+                    </span>
                   {% endif %}
                 </td>
-                <td class="status-cell">
-                  <span class="status-badge status-unknown">UNKNOWN</span>
-                </td>
               </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
       </div>
-
-      <script>
-        const checkBtn = document.getElementById('check-all-btn');
-        const table = document.getElementById('proxy-table');
-        const summaryDiv = document.getElementById('check-summary');
-        const sumOkSpan = document.getElementById('sum-ok');
-        const sumFailSpan = document.getElementById('sum-fail');
-        const progressWrapper = document.getElementById('progress-wrapper');
-        const progressBar = document.getElementById('progress-bar');
-        const progressLabel = document.getElementById('progress-label');
-        const progressDetail = document.getElementById('progress-detail');
-
-        function setStatus(proxy, status) {
-          const row = table.querySelector('tr[data-proxy="' + proxy.replace(/"/g,'&quot;') + '"]');
-          if (!row) return;
-          const cell = row.querySelector('.status-cell');
-          if (!cell) return;
-
-          let label = '';
-          let cls = 'status-badge ';
-
-          if (status === 'checking') {
-            label = 'CHECKING';
-            cls += 'status-checking';
-          } else if (status === 'ok') {
-            label = 'STATUS OK';
-            cls += 'status-ok';
-          } else if (status === 'fail') {
-            label = 'STATUS FAIL';
-            cls += 'status-fail';
-          } else {
-            label = 'UNKNOWN';
-            cls += 'status-unknown';
-          }
-          cell.innerHTML = '<span class="' + cls + '">' + label + '</span>';
-        }
-
-        async function runCheckAll() {
-          const rows = Array.from(table.querySelectorAll('tbody tr'));
-          const total = rows.length;
-          if (!total) return;
-
-          let okCount = 0;
-          let failCount = 0;
-
-          progressWrapper.style.display = 'block';
-          summaryDiv.style.display = 'none';
-          progressBar.style.width = '0%';
-          progressLabel.textContent = '0%';
-          progressDetail.textContent = 'Starting...';
-
-          // Met tous en CHECKING au début
-          rows.forEach(row => {
-            const proxy = row.getAttribute('data-proxy');
-            setStatus(proxy, 'checking');
-          });
-
-          for (let i = 0; i < total; i++) {
-            const row = rows[i];
-            const proxy = row.getAttribute('data-proxy');
-            progressDetail.textContent = 'Checking ' + (i + 1) + ' / ' + total;
-
-            try {
-              const resp = await fetch('{{ url_for("proxies_check_one") }}', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'X-Requested-With': 'XMLHttpRequest'
-                },
-                body: JSON.stringify({ proxy: proxy })
-              });
-              const data = await resp.json();
-              const status = (data && data.status === 'ok') ? 'ok' : 'fail';
-              if (status === 'ok') okCount++; else failCount++;
-              setStatus(proxy, status);
-            } catch (e) {
-              failCount++;
-              setStatus(proxy, 'fail');
-            }
-
-            const pct = Math.round(((i + 1) / total) * 100);
-            progressBar.style.width = pct + '%';
-            progressLabel.textContent = pct + '%';
-          }
-
-          progressDetail.textContent = 'Completed';
-          summaryDiv.style.display = 'block';
-          sumOkSpan.textContent = okCount + ' OK';
-          sumFailSpan.textContent = failCount + ' Failed';
-        }
-
-        if (checkBtn) {
-          checkBtn.addEventListener('click', () => {
-            runCheckAll();
-          });
-        }
-      </script>
-    """, stats=stats, rows=table_data, timeout=CHECK_TIMEOUT)
+    """, rows=rows)
     return render_template_string(
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Proxies",
-        body=body,
         active="proxies",
         stats=stats,
+        body=body,
     )
-
-
-@app.route("/proxies/check-one", methods=["POST"])
-@login_required
-def proxies_check_one():
-    """
-    Vérifie un seul proxy (appelé en boucle par le JS).
-    """
-    data = request.get_json(silent=True) or {}
-    proxy_line = (data.get("proxy") or "").strip()
-    if not proxy_line:
-        return jsonify({"status": "fail", "error": "no proxy"}), 400
-
-    ok = check_proxy(proxy_line)
-    return jsonify({"status": "ok" if ok else "fail"})
 
 
 @app.route("/settings", methods=["GET", "POST"])
 @login_required
 def settings():
-    stats = compute_stats()
     cfg = get_config()
-    msg = None
+    stats = compute_stats()
     error = None
 
     if request.method == "POST":
-        new_user = request.form.get("username", "").strip()
-        new_pass = request.form.get("password", "")
-        confirm = request.form.get("confirm", "")
-        if new_pass and new_pass != confirm:
-            error = "Password confirmation does not match."
+        listen_host = request.form.get("listen_host", "").strip()
+        listen_port_str = request.form.get("listen_port", "").strip()
+        proxy_source = request.form.get("proxy_source", "").strip()
+        db_file = request.form.get("db_file", "").strip()
+        new_user = request.form.get("admin_username", "").strip()
+        new_pass = request.form.get("admin_password", "")
+
+        try:
+            listen_port = int(listen_port_str)
+        except ValueError:
+            listen_port = None
+
+        if not listen_host or listen_port is None:
+            error = "Invalid host/port."
         else:
-            set_admin_password(new_user or cfg["admin_username"], new_pass or None)
-            msg = "Settings updated."
-            cfg = get_config()
+            cfg["listen_host"] = listen_host
+            cfg["listen_port"] = listen_port
+            if proxy_source:
+                cfg["proxy_source"] = proxy_source
+            if db_file:
+                cfg["db_file"] = db_file
+            if new_user:
+                cfg["admin_username"] = new_user
+            if new_pass:
+                cfg["password_hash"] = generate_password_hash(new_pass)
+            save_config(cfg)
+            return redirect(url_for("settings"))
 
     body = render_template_string("""
       <h2>Settings</h2>
+      {% if error %}
+        <div class="error-msg">{{ error }}</div>
+      {% endif %}
       <div class="card">
-        <h3>Admin account</h3>
         <form method="post">
           <div class="form-row">
             <div>
-              <label>Username</label>
-              <input type="text" name="username" value="{{ cfg.admin_username }}">
+              <label for="listen_host">Listen host</label>
+              <input id="listen_host" name="listen_host" value="{{ cfg.listen_host }}">
+            </div>
+            <div>
+              <label for="listen_port">Listen port</label>
+              <input id="listen_port" name="listen_port" type="number" value="{{ cfg.listen_port }}">
+            </div>
+          </div>
+          <div class="form-row">
+            <div style="flex:1;">
+              <label for="proxy_source">Proxy source file</label>
+              <input id="proxy_source" name="proxy_source" value="{{ cfg.proxy_source }}">
+            </div>
+          </div>
+          <div class="form-row">
+            <div style="flex:1;">
+              <label for="db_file">DB file</label>
+              <input id="db_file" name="db_file" value="{{ cfg.db_file }}">
             </div>
           </div>
           <div class="form-row">
             <div>
-              <label>New password (optional)</label>
-              <input type="password" name="password" placeholder="Leave blank to keep current">
+              <label for="admin_username">Admin username</label>
+              <input id="admin_username" name="admin_username" value="{{ cfg.admin_username }}">
             </div>
             <div>
-              <label>Confirm password</label>
-              <input type="password" name="confirm" placeholder="Repeat new password">
+              <label for="admin_password">New admin password (optional)</label>
+              <input id="admin_password" name="admin_password" type="password" placeholder="Leave blank to keep current">
             </div>
           </div>
-          {% if error %}
-            <div class="error-msg">{{ error }}</div>
-          {% endif %}
-          {% if msg %}
-            <div class="muted" style="color:#bbf7d0;margin-top:4px;">{{ msg }}</div>
-          {% endif %}
           <button class="btn" type="submit" style="margin-top:8px;">Save settings</button>
         </form>
       </div>
-    """, cfg=cfg, msg=msg, error=error)
+    """, cfg=cfg, error=error)
     return render_template_string(
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Settings",
-        body=body,
         active="settings",
         stats=stats,
+        body=body,
     )
 
 
-# =============================
-# Lancement
-# =============================
-
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Simple proxy management panel")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=1991)
-    args = parser.parse_args()
-
-    ensure_config()
-    ensure_db()
-
-    app.run(host=args.host, port=args.port, debug=False)
+    cfg = get_config()
+    host = cfg.get("listen_host", "0.0.0.0")
+    port = cfg.get("listen_port", 1991)
+    try:
+        port = int(port)
+    except Exception:
+        port = 1991
+    print(f"[{datetime.datetime.now().isoformat()}] Starting {APP_TITLE} on {host}:{port}")
+    app.run(host=host, port=port, debug=False)
 
 
 if __name__ == "__main__":
