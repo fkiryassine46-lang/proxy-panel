@@ -23,7 +23,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # Configuration de base
 # -----------------------------
 
-APP_TITLE = "Eagle Proxy Panel"
+APP_TITLE = "Proxy Panel"
 
 PROXY_SOURCE_FILE = "/root/proxies.txt"
 DB_FILE = "/root/proxy_panel_db.json"
@@ -232,7 +232,7 @@ def check_proxy(proxy_line: str, timeout: float = CHECK_TIMEOUT) -> bool:
 # Templates
 # =============================
 
-# ---- LOGIN : thème “enterprise” sombre / bleu ----
+# ---- LOGIN : même structure, couleurs néon + photo de proxy ----
 LOGIN_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -245,100 +245,84 @@ LOGIN_TEMPLATE = """
     body {
       margin: 0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      /* fond data center bleu/violet */
+      /* Photo de datacenter + overlay sombre néon */
       background-image:
-        linear-gradient(135deg, rgba(15,23,42,0.92), rgba(30,64,175,0.92)),
+        radial-gradient(circle at top left, rgba(0, 245, 255, 0.25), transparent 55%),
+        radial-gradient(circle at bottom right, rgba(255, 45, 251, 0.22), transparent 55%),
+        linear-gradient(160deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
         url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
       background-size: cover;
       background-position: center;
       background-attachment: fixed;
-      min-height: 100vh;
+      color: #e5e7eb;
+      height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      color: #0f172a;
     }
     .card {
       width: 380px;
-      border-radius: 26px;
-      padding: 26px 30px 26px;
+      border-radius: 20px;
+      padding: 28px 30px 26px;
       background:
-        radial-gradient(circle at top left, rgba(129,140,248,0.22), transparent 60%),
-        radial-gradient(circle at bottom right, rgba(56,189,248,0.20), transparent 60%),
-        #ffffff;
-      border: 1px solid rgba(129,140,248,0.7);
+        radial-gradient(circle at top left, rgba(0,245,255,0.09), transparent 60%),
+        radial-gradient(circle at bottom right, rgba(255,45,251,0.10), transparent 60%),
+        rgba(15,23,42,0.96);
+      border: 1px solid rgba(59,130,246,0.6);
       box-shadow:
-        0 18px 40px rgba(15,23,42,0.85),
-        0 0 40px rgba(59,130,246,0.65);
+        0 0 30px rgba(0,245,255,0.4),
+        0 30px 80px rgba(0,0,0,0.9);
+      backdrop-filter: blur(6px);
     }
-
-    /* --- LOGO EAGLE (image) --- */
-    .eagle-logo-wrap {
-      display:flex;
-      flex-direction:column;
-      align-items:center;
-      justify-content:center;
-      margin-bottom:18px;
+    .badge {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .16em;
+      color: #a5b4fc;
+      margin-bottom: 8px;
     }
-    .eagle-logo-img {
-      width:80px;
-      height:80px;
-      border-radius:24px;
-      object-fit:cover;
-      box-shadow:
-        0 0 20px rgba(251,191,36,0.8),
-        0 0 35px rgba(30,64,175,0.8);
-      border: 2px solid rgba(30,64,175,0.9);
-      background:#020617;
+    .logo {
+      font-weight: 700;
+      letter-spacing: .24em;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #e5e7eb;
+      margin-bottom: 14px;
     }
-    .eagle-text-main {
-      margin-top:10px;
-      font-size:13px;
-      letter-spacing:.32em;
-      text-transform:uppercase;
-      color:#6b7280;
+    .logo span {
+      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
     }
-    .eagle-text-sub {
-      margin-top:4px;
-      font-size:14px;
-      letter-spacing:.18em;
-      text-transform:uppercase;
-      background: linear-gradient(135deg,#3b82f6,#a855f7);
-      -webkit-background-clip:text;
-      background-clip:text;
-      color:transparent;
-    }
-
     h1 {
       margin: 0 0 6px;
       font-size: 22px;
-      color:#0f172a;
     }
     .subtitle {
       font-size: 13px;
-      color: #6b7280;
+      color: #9ca3af;
       margin-bottom: 18px;
     }
     label {
       display: block;
       font-size: 13px;
-      color: #111827;
+      color: #e5e7eb;
       margin-bottom: 5px;
     }
     input {
       width: 100%;
       border-radius: 999px;
-      border: 1px solid rgba(148,163,184,0.9);
-      background: #f9fafb;
-      color: #0f172a;
+      border: 1px solid rgba(30,64,175,0.9);
+      background: rgba(2,6,23,0.95);
+      color: #e5e7eb;
       font-size: 14px;
       padding: 9px 12px;
       outline: none;
     }
     input:focus {
-      border-color: #3b82f6;
-      box-shadow: 0 0 0 1px rgba(59,130,246,0.55);
-      background:#ffffff;
+      border-color: #0ea5e9;
+      box-shadow: 0 0 0 1px rgba(14,165,233,0.6), 0 0 12px rgba(56,189,248,0.7);
     }
     .field {
       margin-bottom: 14px;
@@ -351,31 +335,27 @@ LOGIN_TEMPLATE = """
       padding: 10px 0;
       font-size: 14px;
       font-weight: 600;
-      letter-spacing: .08em;
+      letter-spacing: .06em;
       text-transform: uppercase;
       cursor: pointer;
-      color: #f9fafb;
-      background: linear-gradient(135deg,#3b82f6,#a855f7);
+      color: #0b1120;
+      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7);
       box-shadow:
-        0 10px 24px rgba(59,130,246,0.7),
-        0 0 30px rgba(129,140,248,0.9);
+        0 0 25px rgba(34,197,94,0.8),
+        0 0 40px rgba(14,165,233,0.7);
     }
-    .btn:hover { filter: brightness(1.05); }
+    .btn:hover { filter: brightness(1.08); }
     .error {
       margin-top: 10px;
       font-size: 13px;
-      color: #b91c1c;
+      color: #fb7185;
     }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="eagle-logo-wrap">
-      <img src="/static/eagle_logo.png" alt="Eagle logo" class="eagle-logo-img">
-      <div class="eagle-text-main">EAGLE</div>
-      <div class="eagle-text-sub">Eagle Proxy Panel</div>
-    </div>
-
+    <div class="badge">Admin console</div>
+    <div class="logo"><span>{{ title }}</span></div>
     <h1>Sign in</h1>
     <div class="subtitle">Secure access to your proxy management dashboard.</div>
 
@@ -399,7 +379,7 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
-# ---- LAYOUT : thème dashboard corporate ----
+# ---- LAYOUT : même structure, néon + même “check proxies” ----
 LAYOUT_TEMPLATE = """
 {% macro nav_link(href, label, active_name) -%}
   <a href="{{ href }}" class="nav-link {{ 'active' if active == active_name else '' }}">{{ label }}</a>
@@ -413,25 +393,31 @@ LAYOUT_TEMPLATE = """
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     :root {
-      --bg-main: #0f172a;
-      --text-main: #0f172a;
-      --text-muted: #6b7280;
-      --accent-primary: #3b82f6;   /* bleu */
-      --accent-secondary: #a855f7; /* mauve */
-      --accent-ok: #16a34a;
-      --accent-fail: #b91c1c;
+      --bg-main: #020617;
+      --text-main: #e5e7eb;
+      --text-muted: #9ca3af;
+      --accent-primary: #0ea5e9;   /* cyan */
+      --accent-secondary: #a855f7; /* violet */
+      --accent-tertiary: #22c55e;  /* vert néon */
+      --accent-ok: #22c55e;
+      --accent-fail: #fb923c;
       --accent-warn: #eab308;
     }
     * { box-sizing:border-box; }
     body {
       margin:0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      /* même photo de fond que login */
       background-image:
-        radial-gradient(circle at 0% 0%, rgba(59,130,246,0.25), transparent 60%),
-        radial-gradient(circle at 100% 0%, rgba(168,85,247,0.20), transparent 60%),
-        linear-gradient(180deg, #0f172a, #020617);
-      min-height:100vh;
+        radial-gradient(circle at 0% 0%, rgba(14,165,233,0.20), transparent 60%),
+        radial-gradient(circle at 100% 0%, rgba(168,85,247,0.18), transparent 60%),
+        linear-gradient(180deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
+        url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
+      background-size: cover;
+      background-position: center;
+      background-attachment: fixed;
       color:var(--text-main);
+      min-height:100vh;
     }
     .shell {
       max-width: 1280px;
@@ -444,43 +430,27 @@ LAYOUT_TEMPLATE = """
       justify-content:space-between;
       margin-bottom:18px;
     }
-
-    /* HEADER LOGO AVEC IMAGE */
     .brand {
-      display:flex;
-      align-items:center;
-      gap:10px;
-    }
-    .eagle-header-logo {
-      width:32px;
-      height:32px;
-      border-radius:10px;
-      object-fit:cover;
-      box-shadow:
-        0 0 14px rgba(251,191,36,0.9),
-        0 0 24px rgba(37,99,235,0.8);
-      border:2px solid rgba(37,99,235,0.9);
-      background:#020617;
-    }
-    .eagle-header-text {
       display:flex;
       flex-direction:column;
       gap:2px;
     }
-    .eagle-header-title {
-      font-size:13px;
-      letter-spacing:.20em;
+    .brand-title {
+      font-weight:700;
+      letter-spacing:.2em;
+      font-size:12px;
       text-transform:uppercase;
-      background: linear-gradient(135deg,#3b82f6,#a855f7);
+    }
+    .brand-title span {
+      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
       -webkit-background-clip:text;
       background-clip:text;
       color:transparent;
     }
-    .eagle-header-sub {
+    .brand-sub {
       font-size:11px;
       color:var(--text-muted);
     }
-
     nav {
       display:flex;
       gap:10px;
@@ -490,42 +460,42 @@ LAYOUT_TEMPLATE = """
       font-size:13px;
       padding:7px 14px;
       border-radius:999px;
-      color:#0f172a;
+      color:#e5e7eb;
       text-decoration:none;
-      border:1px solid rgba(209,213,219,0.9);
-      background:#f9fafb;
+      border:1px solid rgba(148,163,184,0.45);
+      background:rgba(15,23,42,0.86);
+      box-shadow:0 0 0 1px rgba(15,23,42,0.9);
     }
     .nav-link:hover {
       border-color:var(--accent-primary);
-      box-shadow:0 0 14px rgba(59,130,246,0.5);
+      box-shadow:0 0 14px rgba(14,165,233,0.7);
     }
     .nav-link.active {
-      color:#f9fafb;
+      color:#0b1120;
       background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
       border-color:transparent;
       box-shadow:
-        0 0 18px rgba(59,130,246,0.8),
-        0 0 28px rgba(129,140,248,0.9);
+        0 0 18px rgba(14,165,233,0.9),
+        0 0 28px rgba(168,85,247,0.7);
     }
     .logout-link {
       font-size:12px;
       padding:7px 11px;
       border-radius:999px;
-      border:1px solid rgba(209,213,219,0.9);
-      background:#ffffff;
+      border:1px solid rgba(148,163,184,0.45);
+      background:rgba(15,23,42,0.9);
       color:var(--text-muted);
       text-decoration:none;
     }
     .logout-link:hover {
       border-color:var(--accent-secondary);
-      color:#111827;
-      box-shadow:0 0 14px rgba(168,85,247,0.4);
+      color:#f9fafb;
+      box-shadow:0 0 14px rgba(168,85,247,0.7);
     }
 
     h2 {
       margin:0 0 14px;
       font-size:20px;
-      color:#0f172a;
     }
 
     .grid {
@@ -535,22 +505,26 @@ LAYOUT_TEMPLATE = """
       margin-bottom:18px;
     }
     .card {
-      background:#ffffff;
+      background:
+        radial-gradient(circle at top left, rgba(14,165,233,0.20), transparent 55%),
+        radial-gradient(circle at bottom right, rgba(168,85,247,0.18), transparent 55%),
+        rgba(15,23,42,0.92);
       border-radius:18px;
       padding:16px 18px;
-      border:1px solid rgba(209,213,219,0.9);
+      border:1px solid rgba(59,130,246,0.6);
       box-shadow:
-        0 10px 30px rgba(15,23,42,0.25);
+        0 0 26px rgba(14,165,233,0.45),
+        0 24px 70px rgba(0,0,0,0.9);
+      backdrop-filter: blur(4px);
     }
     .card h3 {
       margin:0 0 6px;
       font-size:14px;
-      color:#111827;
+      color:#e5e7eb;
     }
     .card .big {
       font-size:28px;
       font-weight:600;
-      color:#111827;
     }
     .muted {
       font-size:12px;
@@ -565,7 +539,7 @@ LAYOUT_TEMPLATE = """
     th, td {
       padding:8px 10px;
       text-align:left;
-      border-bottom:1px solid rgba(229,231,235,0.9);
+      border-bottom:1px solid rgba(31,41,55,0.9);
     }
     th {
       font-size:11px;
@@ -574,7 +548,7 @@ LAYOUT_TEMPLATE = """
       color:var(--text-muted);
     }
     tr:hover td {
-      background:#f9fafb;
+      background:rgba(15,23,42,0.9);
     }
 
     .pill {
@@ -582,9 +556,9 @@ LAYOUT_TEMPLATE = """
       padding:3px 8px;
       border-radius:999px;
       font-size:11px;
-      border:1px solid rgba(209,213,219,0.9);
-      color:#111827;
-      background:#f3f4ff;
+      border:1px solid rgba(148,163,184,0.6);
+      color:#e5e7eb;
+      background:rgba(15,23,42,0.96);
     }
 
     .btn {
@@ -596,23 +570,23 @@ LAYOUT_TEMPLATE = """
       border:none;
       cursor:pointer;
       font-size:13px;
-      color:#f9fafb;
-      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
+      color:#020617;
+      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary),var(--accent-tertiary));
       box-shadow:
-        0 10px 25px rgba(59,130,246,0.6),
-        0 0 24px rgba(129,140,248,0.8);
+        0 0 22px rgba(14,165,233,0.9),
+        0 0 32px rgba(168,85,247,0.7);
     }
-    .btn:hover { filter:brightness(1.05); }
+    .btn:hover { filter:brightness(1.06); }
 
     .btn-secondary {
-      background:#f9fafb;
-      border:1px solid rgba(209,213,219,0.9);
-      color:#111827;
+      background:rgba(15,23,42,0.96);
+      border:1px solid rgba(148,163,184,0.7);
+      color:var(--text-main);
       box-shadow:none;
     }
     .btn-secondary:hover {
       border-color:var(--accent-primary);
-      box-shadow:0 0 12px rgba(59,130,246,0.4);
+      box-shadow:0 0 16px rgba(14,165,233,0.7);
     }
 
     .status-badge {
@@ -623,24 +597,27 @@ LAYOUT_TEMPLATE = """
       border:1px solid transparent;
     }
     .status-ok {
-      background:rgba(22,163,74,0.10);
-      color:#166534;
-      border-color:rgba(22,163,74,0.9);
+      background:rgba(34,197,94,0.16);
+      color:#bbf7d0;
+      border-color:rgba(34,197,94,0.8);
+      box-shadow:0 0 10px rgba(34,197,94,0.7);
     }
     .status-fail {
-      background:rgba(248,113,113,0.10);
-      color:#b91c1c;
-      border-color:rgba(239,68,68,0.9);
+      background:rgba(248,113,113,0.16);
+      color:#fed7aa;
+      border-color:rgba(248,113,113,0.9);
+      box-shadow:0 0 10px rgba(248,113,113,0.7);
     }
     .status-unknown {
-      background:rgba(209,213,219,0.4);
-      color:#374151;
-      border-color:rgba(156,163,175,0.9);
+      background:rgba(148,163,184,0.18);
+      color:#e5e7eb;
+      border-color:rgba(148,163,184,0.9);
     }
     .status-checking {
-      background:rgba(251,191,36,0.10);
-      color:#92400e;
-      border-color:rgba(217,119,6,0.9);
+      background:rgba(234,179,8,0.18);
+      color:#facc15;
+      border-color:rgba(234,179,8,0.9);
+      box-shadow:0 0 10px rgba(250,204,21,0.7);
     }
 
     .form-row {
@@ -657,9 +634,9 @@ LAYOUT_TEMPLATE = """
     }
     .form-row input {
       border-radius:999px;
-      border:1px solid rgba(209,213,219,0.9);
-      background:#f9fafb;
-      color:#111827;
+      border:1px solid rgba(51,65,85,0.9);
+      background:rgba(2,6,23,0.96);
+      color:#e5e7eb;
       padding:7px 12px;
       min-width:140px;
       font-size:13px;
@@ -667,12 +644,11 @@ LAYOUT_TEMPLATE = """
     .form-row input:focus {
       outline:none;
       border-color:var(--accent-primary);
-      box-shadow:0 0 0 1px rgba(59,130,246,0.4);
-      background:#ffffff;
+      box-shadow:0 0 0 1px rgba(14,165,233,0.6);
     }
 
     .error-msg {
-      color:#b91c1c;
+      color:#fb7185;
       font-size:12px;
       margin-top:4px;
     }
@@ -682,6 +658,7 @@ LAYOUT_TEMPLATE = """
       font-size:11px;
       color:var(--text-muted);
       text-align:center;
+      text-shadow:0 0 10px rgba(15,23,42,0.9);
     }
 
     .progress-wrapper {
@@ -693,16 +670,17 @@ LAYOUT_TEMPLATE = """
       width:100%;
       height:7px;
       border-radius:999px;
-      background:#e5e7eb;
+      background:rgba(15,23,42,0.96);
       overflow:hidden;
       margin-top:6px;
-      border:1px solid rgba(209,213,219,0.9);
+      border:1px solid rgba(31,41,55,0.9);
+      box-shadow:0 0 14px rgba(14,165,233,0.6);
     }
     .progress-bar-inner {
       height:100%;
       width:0%;
       border-radius:999px;
-      background:linear-gradient(90deg,#3b82f6,#a855f7);
+      background:linear-gradient(90deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
       transition:width .18s ease-out;
     }
 
@@ -710,37 +688,14 @@ LAYOUT_TEMPLATE = """
       header { flex-direction:column; align-items:flex-start; gap:10px; }
       .shell { padding:14px 14px 24px; }
     }
-
-    .pre-proxies {
-      width:100%;
-      min-height:260px;
-      border-radius:16px;
-      border:1px solid rgba(209,213,219,0.9);
-      background:#f9fafb;
-      padding:10px;
-      color:#111827;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size:12px;
-      resize:vertical;
-    }
-
-    .clipboard-info {
-      margin-top:6px;
-      font-size:11px;
-      color:var(--text-muted);
-    }
-
   </style>
 </head>
 <body>
   <div class="shell">
     <header>
       <div class="brand">
-        <img src="/static/eagle_logo.png" alt="Eagle logo" class="eagle-header-logo">
-        <div class="eagle-header-text">
-          <div class="eagle-header-title">Eagle Proxy Panel</div>
-          <div class="eagle-header-sub">Internal proxy management console</div>
-        </div>
+        <div class="brand-title"><span>{{ title }}</span></div>
+        <div class="brand-sub">Internal proxy management console</div>
       </div>
       <nav>
         {{ nav_link(url_for('dashboard'), 'Dashboard', 'dashboard') }}
@@ -1142,7 +1097,6 @@ def proxies():
           progressLabel.textContent = '0%';
           progressDetail.textContent = 'Starting...';
 
-          // Met tous en CHECKING au début
           rows.forEach(row => {
             const proxy = row.getAttribute('data-proxy');
             setStatus(proxy, 'checking');
