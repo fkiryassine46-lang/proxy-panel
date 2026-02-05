@@ -2,238 +2,162 @@
 import os
 import json
 import datetime
-import socket
 from functools import wraps
+from io import BytesIO
 
-from flask import Flask, request, redirect, url_for, render_template_string, session, send_file, abort
+import requests
+from flask import (
+    Flask,
+    request,
+    redirect,
+    url_for,
+    render_template_string,
+    session,
+    send_file,
+    jsonify,
+    abort,
+)
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# -----------------------------
+# Configuration de base
+# -----------------------------
 
 APP_TITLE = "Proxy Panel"
 
-DEFAULT_CONFIG = {
-    "admin_username": "admin",
-    "password_hash": generate_password_hash("admin"),
-    "listen_host": "0.0.0.0",
-    "listen_port": 1991,
-    "proxy_source": "/root/proxies.txt",
-    "db_file": "/root/proxy_panel_db.json",
-    "config_file": "/root/proxy_panel_config.json",
-}
+PROXY_SOURCE_FILE = "/root/proxies.txt"
+DB_FILE = "/root/proxy_panel_db.json"
+CONFIG_FILE = "/root/proxy_panel_config.json"
+
+CHECK_TEST_URL = "https://www.google.com"
+CHECK_TIMEOUT = 20  # secondes
+
+app = Flask(__name__)
+app.secret_key = "change-me-if-you-want"  # pour la session Flask
+
 
 # =============================
-# Helper functions for config/db
+# Utilitaires fichiers
 # =============================
 
 def load_json(path, default):
+    if not os.path.exists(path):
+        return default
     try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        pass
-    return default
+        return default
 
 
 def save_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
 
 
-def get_config():
-    cfg_path = DEFAULT_CONFIG["config_file"]
-    cfg = load_json(cfg_path, DEFAULT_CONFIG)
-    # ensure all keys exist
-    for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, v)
+# =============================
+# Config admin (login / pass)
+# =============================
+
+def ensure_config():
+    cfg = load_json(CONFIG_FILE, {})
+    changed = False
+    if "admin_username" not in cfg:
+        cfg["admin_username"] = "admin"
+        changed = True
+    if "password_hash" not in cfg:
+        cfg["password_hash"] = generate_password_hash("lolopolo")
+        changed = True
+    if changed:
+        save_json(CONFIG_FILE, cfg)
     return cfg
 
 
-def save_config(cfg):
-    cfg_path = DEFAULT_CONFIG["config_file"]
-    save_json(cfg_path, cfg)
+def get_config():
+    return ensure_config()
 
 
-def get_db():
+def set_admin_password(new_username, new_password):
     cfg = get_config()
-    db_path = cfg["db_file"]
-    db = load_json(db_path, {"clients": {}, "assignments": {}})
-    db.setdefault("clients", {})
-    db.setdefault("assignments", {})
+    if new_username:
+        cfg["admin_username"] = new_username
+    if new_password:
+        cfg["password_hash"] = generate_password_hash(new_password)
+    save_json(CONFIG_FILE, cfg)
+
+
+# =============================
+# DB clients / proxies
+# =============================
+
+def ensure_db():
+    db = load_json(DB_FILE, {})
+    changed = False
+    if "clients" not in db:
+        db["clients"] = []
+        changed = True
+    if "assigned_proxies" not in db:
+        db["assigned_proxies"] = {}  # proxy_line -> client_id
+        changed = True
+    if changed:
+        save_json(DB_FILE, db)
     return db
 
 
+def get_db():
+    return ensure_db()
+
+
 def save_db(db):
-    cfg = get_config()
-    db_path = cfg["db_file"]
-    save_json(db_path, db)
+    save_json(DB_FILE, db)
+
+
+def next_client_id(db):
+    if not db["clients"]:
+        return 1
+    return max(c["id"] for c in db["clients"]) + 1
 
 
 # =============================
-# Proxy parsing / assignment
+# Proxies: chargement + stats
 # =============================
 
-def parse_proxy_line(line):
-    """
-    Parse lines in format:
-      host:port
-      host:port:user:pass
-    Return dict with keys: host, port, user, password (user/password optional).
-    """
-    line = line.strip()
-    if not line or line.startswith("#"):
-        return None
-    parts = line.split(":")
-    if len(parts) < 2:
-        return None
-    host = parts[0]
-    port = parts[1]
-    user = parts[2] if len(parts) > 2 else None
-    password = parts[3] if len(parts) > 3 else None
-    return {
-        "host": host,
-        "port": port,
-        "user": user,
-        "password": password,
-    }
-
-
-def load_all_proxies():
-    cfg = get_config()
-    path = cfg["proxy_source"]
+def load_proxy_list():
+    if not os.path.exists(PROXY_SOURCE_FILE):
+        return []
     proxies = []
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                p = parse_proxy_line(line)
-                if p:
-                    proxies.append(p)
+    with open(PROXY_SOURCE_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            proxies.append(line)
     return proxies
 
 
-def build_proxy_url(proxy):
-    """Return proxy URL string from parsed proxy dict, e.g. http://user:pass@host:port."""
-    auth = ""
-    if proxy.get("user") and proxy.get("password"):
-        auth = f"{proxy['user']}:{proxy['password']}@"
-    return f"http://{auth}{proxy['host']}:{proxy['port']}"
-
-
-def get_all_proxy_ids():
-    """Use host:port as a unique proxy key."""
-    proxies = load_all_proxies()
-    proxy_ids = []
-    for p in proxies:
-        proxy_ids.append(f"{p['host']}:{p['port']}")
-    return proxy_ids
-
-
 def compute_stats():
-    cfg = get_config()
     db = get_db()
-    proxies = load_all_proxies()
-    total_proxies = len(proxies)
+    all_proxies = load_proxy_list()
+    assigned = set(db["assigned_proxies"].keys())
+    total = len(all_proxies)
+    assigned_count = len(assigned & set(all_proxies))
+    available_count = total - assigned_count
     clients_count = len(db["clients"])
-
-    all_ids = set(get_all_proxy_ids())
-    assignments = db["assignments"]
-    assigned_ids = set(assignments.values())
-    available_ids = all_ids - assigned_ids
-
     return {
-        "total_proxies": total_proxies,
+        "total_proxies": total,
+        "assigned_proxies": assigned_count,
+        "available_proxies": available_count,
         "clients_count": clients_count,
-        "assigned_proxies": len(assigned_ids),
-        "available_proxies": len(available_ids),
-        "proxy_source": cfg["proxy_source"],
-        "db_file": cfg["db_file"],
+        "proxy_source": PROXY_SOURCE_FILE,
+        "db_file": DB_FILE,
     }
 
 
-def assign_proxies_evenly():
-    """
-    Read clients and proxies. Assign proxies to each client as evenly as possible.
-    Clients have "count" specifying desired number of proxies.
-    """
-    db = get_db()
-    clients = db["clients"]
-    proxies = get_all_proxy_ids()
-    assignments = {}  # proxy_id -> client_name
-
-    if not clients or not proxies:
-        db["assignments"] = assignments
-        save_db(db)
-        return
-
-    client_list = [(name, info["count"]) for name, info in clients.items()]
-    client_list.sort(key=lambda x: x[0])
-
-    expanded_clients = []
-    for name, count in client_list:
-        for _ in range(count):
-            expanded_clients.append(name)
-
-    if not expanded_clients:
-        db["assignments"] = {}
-        save_db(db)
-        return
-
-    assigned = {}
-    i = 0
-    for p in proxies:
-        client_name = expanded_clients[i % len(expanded_clients)]
-        assigned[p] = client_name
-        i += 1
-
-    db["assignments"] = assigned
-    save_db(db)
-
-
-def get_client_proxies(client_name):
-    """Return list of (proxy_id, proxy_url) for given client."""
-    db = get_db()
-    assignments = db["assignments"]
-    proxies = load_all_proxies()
-    proxy_map = {}
-    for p in proxies:
-        pid = f"{p['host']}:{p['port']}"
-        proxy_map[pid] = p
-
-    result = []
-    for pid, assigned_client in assignments.items():
-        if assigned_client == client_name and pid in proxy_map:
-            p = proxy_map[pid]
-            result.append((pid, build_proxy_url(p)))
-    return result
-
-
-def check_proxy(proxy, timeout=2.0):
-    """
-    Basic TCP connectivity check.
-    """
-    try:
-        host = proxy["host"]
-        port = int(proxy["port"])
-    except Exception:
-        return False
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            s.connect((host, port))
-        return True
-    except Exception:
-        return False
-
-
 # =============================
-# Flask app and auth
+# Login / sessions
 # =============================
-
-app = Flask(__name__)
-app.secret_key = os.environ.get("PROXY_PANEL_SECRET", "change_me_please")
-
 
 def login_required(f):
     @wraps(f)
@@ -245,282 +169,217 @@ def login_required(f):
 
 
 # =============================
-# TEMPLATES (HTML/CSS)
+# Parsing / check des proxies
 # =============================
 
-# ---- LOGIN THEME (modern + bg server) ----
+def parse_proxy_line(line: str):
+    """
+    Accepte :
+      IP:PORT
+      IP:PORT:USER:PASS
+    Retourne dict ou None si invalide.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split(":")
+    if len(parts) == 2:
+        host, port = parts
+        user = password = None
+    elif len(parts) == 4:
+        host, port, user, password = parts
+    else:
+        return None
+    try:
+        port = int(port)
+    except ValueError:
+        return None
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+    }
+
+
+def build_proxy_url(info: dict) -> str:
+    if info["user"] and info["password"]:
+        return f"http://{info['user']}:{info['password']}@{info['host']}:{info['port']}"
+    else:
+        return f"http://{info['host']}:{info['port']}"
+
+
+def check_proxy(proxy_line: str, timeout: float = CHECK_TIMEOUT) -> bool:
+    """
+    Test via HTTPS sur Google.
+    True = OK, False = FAIL.
+    """
+    info = parse_proxy_line(proxy_line)
+    if not info:
+        return False
+
+    proxy_url = build_proxy_url(info)
+    proxies = {"http": proxy_url, "https": proxy_url}
+
+    try:
+        r = requests.get(CHECK_TEST_URL, proxies=proxies, timeout=timeout)
+        return 200 <= r.status_code < 400
+    except Exception:
+        return False
+
+
+# =============================
+# Templates
+# =============================
+
+# ---- LOGIN : même structure, couleurs néon + photo de proxy ----
 LOGIN_TEMPLATE = """
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>{{ title }} - Connexion</title>
+  <title>{{ title }} - Login</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     * { box-sizing:border-box; }
-
-    :root {
-      --bg-overlay: rgba(2,6,23,0.90);
-      --card-bg: rgba(15,23,42,0.92);
-      --card-border: rgba(148,163,184,0.35);
-      --text-main: #e5e7eb;
-      --text-muted: #9ca3af;
-      --accent: #22c55e;
-      --accent-alt: #2563eb;
-      --danger: #f97316;
-    }
-
     body {
-      margin:0;
-      min-height:100vh;
+      margin: 0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      color: var(--text-main);
+      /* Photo de datacenter + overlay sombre néon */
       background-image:
-        linear-gradient(120deg, rgba(15,23,42,0.92), rgba(15,23,42,0.96)),
-        url("https://images.pexels.com/photos/325229/pexels-photo-325229.jpeg?auto=compress&cs=tinysrgb&w=1600");
+        radial-gradient(circle at top left, rgba(0, 245, 255, 0.25), transparent 55%),
+        radial-gradient(circle at bottom right, rgba(255, 45, 251, 0.22), transparent 55%),
+        linear-gradient(160deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
+        url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
       background-size: cover;
       background-position: center;
       background-attachment: fixed;
+      color: #e5e7eb;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
-
-    .page {
-      min-height:100vh;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      padding:24px;
-      background: radial-gradient(circle at top left, rgba(37,99,235,0.30), transparent 55%);
-    }
-
-    .shell {
-      width:100%;
-      max-width:980px;
-      display:grid;
-      grid-template-columns: minmax(0,1.2fr) minmax(0,1fr);
-      gap:28px;
-    }
-
-    .hero-card,
-    .form-card {
-      position:relative;
-      border-radius:22px;
-      padding:22px 24px;
-      border:1px solid var(--card-border);
+    .card {
+      width: 380px;
+      border-radius: 20px;
+      padding: 28px 30px 26px;
       background:
-        linear-gradient(135deg, rgba(15,23,42,0.98), rgba(15,23,42,0.96));
+        radial-gradient(circle at top left, rgba(0,245,255,0.09), transparent 60%),
+        radial-gradient(circle at bottom right, rgba(255,45,251,0.10), transparent 60%),
+        rgba(15,23,42,0.96);
+      border: 1px solid rgba(59,130,246,0.6);
       box-shadow:
-        0 18px 40px rgba(0,0,0,0.75),
-        0 0 0 1px rgba(15,23,42,0.9);
-      backdrop-filter: blur(4px);
+        0 0 30px rgba(0,245,255,0.4),
+        0 30px 80px rgba(0,0,0,0.9);
+      backdrop-filter: blur(6px);
     }
-
-    .hero-card::before {
-      content:"";
-      position:absolute;
-      inset:-1px;
-      border-radius:inherit;
-      background:
-        radial-gradient(circle at top left, rgba(59,130,246,0.40), transparent 60%),
-        radial-gradient(circle at top right, rgba(236,72,153,0.40), transparent 60%);
-      mix-blend-mode: screen;
-      opacity:0.6;
-      pointer-events:none;
-      z-index:-1;
-    }
-
     .badge {
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-      padding:6px 12px;
-      border-radius:999px;
-      font-size:12px;
-      color:#e5e7eb;
-      background: radial-gradient(circle at top left,#4f46e5,#22c55e);
-      box-shadow:0 12px 30px rgba(59,130,246,0.75);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .16em;
+      color: #a5b4fc;
+      margin-bottom: 8px;
     }
-    .badge-dot {
-      width:8px;
-      height:8px;
-      border-radius:999px;
-      background:#22c55e;
-      box-shadow:0 0 0 4px rgba(34,197,94,0.35);
+    .logo {
+      font-weight: 700;
+      letter-spacing: .24em;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: #e5e7eb;
+      margin-bottom: 14px;
     }
-
-    .hero-title {
-      margin:10px 0 6px;
-      font-size:26px;
-      font-weight:650;
+    .logo span {
+      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
     }
-    .hero-subtitle {
-      font-size:14px;
-      color:var(--text-muted);
-      max-width:360px;
+    h1 {
+      margin: 0 0 6px;
+      font-size: 22px;
     }
-
-    .hero-tags {
-      display:flex;
-      flex-wrap:wrap;
-      gap:8px;
-      margin-top:18px;
-    }
-    .hero-tag {
-      font-size:11px;
-      padding:6px 10px;
-      border-radius:999px;
-      border:1px solid rgba(148,163,184,0.5);
-      background:rgba(15,23,42,0.92);
-    }
-    .hero-metrics {
-      display:flex;
-      gap:16px;
-      margin-top:22px;
-      font-size:12px;
-    }
-    .hero-metric-label { color:var(--text-muted); }
-    .hero-metric-value { font-size:18px; font-weight:600; }
-
-    .form-card h2 {
-      margin:0 0 6px;
-      font-size:18px;
-    }
-    .form-subtitle {
-      font-size:13px;
-      color:var(--text-muted);
-      margin-bottom:16px;
-    }
-    .field {
-      margin-bottom:14px;
+    .subtitle {
+      font-size: 13px;
+      color: #9ca3af;
+      margin-bottom: 18px;
     }
     label {
-      display:block;
-      font-size:12px;
-      margin-bottom:6px;
-      color:var(--text-muted);
+      display: block;
+      font-size: 13px;
+      color: #e5e7eb;
+      margin-bottom: 5px;
     }
     input {
-      width:100%;
-      border-radius:999px;
-      border:1px solid rgba(148,163,184,0.4);
-      background:rgba(15,23,42,0.98);
-      color:var(--text-main);
-      padding:9px 14px;
-      font-size:14px;
-      outline:none;
-    }
-    input::placeholder {
-      color:#6b7280;
+      width: 100%;
+      border-radius: 999px;
+      border: 1px solid rgba(30,64,175,0.9);
+      background: rgba(2,6,23,0.95);
+      color: #e5e7eb;
+      font-size: 14px;
+      padding: 9px 12px;
+      outline: none;
     }
     input:focus {
-      border-color:var(--accent-alt);
-      box-shadow:0 0 0 1px rgba(37,99,235,0.55);
+      border-color: #0ea5e9;
+      box-shadow: 0 0 0 1px rgba(14,165,233,0.6), 0 0 12px rgba(56,189,248,0.7);
     }
-
+    .field {
+      margin-bottom: 14px;
+    }
     .btn {
-      margin-top:6px;
-      width:100%;
-      border:none;
-      border-radius:999px;
-      padding:10px 0;
-      font-size:14px;
-      font-weight:600;
-      letter-spacing:.03em;
-      text-transform:uppercase;
-      cursor:pointer;
-      color:#f9fafb;
-      background:linear-gradient(135deg,#16a34a,#22c55e);
-      box-shadow:0 14px 40px rgba(22,163,74,0.9);
-      transition:transform .08s ease, box-shadow .08s ease, filter .08s ease;
+      margin-top: 6px;
+      width: 100%;
+      border-radius: 999px;
+      border: none;
+      padding: 10px 0;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      cursor: pointer;
+      color: #0b1120;
+      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7);
+      box-shadow:
+        0 0 25px rgba(34,197,94,0.8),
+        0 0 40px rgba(14,165,233,0.7);
     }
-    .btn:hover {
-      filter:brightness(1.05);
-      transform:translateY(-1px);
-      box-shadow:0 18px 55px rgba(22,163,74,1);
-    }
-
+    .btn:hover { filter: brightness(1.08); }
     .error {
-      margin-top:10px;
-      font-size:13px;
-      color:var(--danger);
-    }
-
-    .footer {
-      margin-top:18px;
-      font-size:11px;
-      color:var(--text-muted);
-      text-align:center;
-    }
-
-    @media (max-width: 900px) {
-      .shell {
-        grid-template-columns: minmax(0,1fr);
-      }
-      .hero-card {
-        display:none;
-      }
+      margin-top: 10px;
+      font-size: 13px;
+      color: #fb7185;
     }
   </style>
 </head>
 <body>
-  <div class="page">
-    <div class="shell">
-      <section class="hero-card">
-        <div class="badge">
-          <span class="badge-dot"></span>
-          Proxy Panel
-        </div>
-        <h1 class="hero-title">Dashboard Proxy Panel</h1>
-        <p class="hero-subtitle">
-          Interface moderne, rapide et lisible. Connexion sécurisée,
-          gestion centralisée et monitoring de tes proxys.
-        </p>
-        <div class="hero-tags">
-          <div class="hero-tag">Sessions</div>
-          <div class="hero-tag">Monitoring</div>
-          <div class="hero-tag">Exports</div>
-        </div>
-        <div class="hero-metrics">
-          <div>
-            <div class="hero-metric-label">Source</div>
-            <div class="hero-metric-value">Fichier local</div>
-          </div>
-          <div>
-            <div class="hero-metric-label">Sécurité</div>
-            <div class="hero-metric-value">Authentifiée</div>
-          </div>
-        </div>
-      </section>
+  <div class="card">
+    <div class="badge">Admin console</div>
+    <div class="logo"><span>{{ title }}</span></div>
+    <h1>Sign in</h1>
+    <div class="subtitle">Secure access to your proxy management dashboard.</div>
 
-      <section class="form-card">
-        <h2>Connexion</h2>
-        <p class="form-subtitle">
-          Entre tes identifiants pour accéder au panel.
-        </p>
-        <form method="post">
-          <div class="field">
-            <label for="username">Nom d'utilisateur</label>
-            <input id="username" name="username" autocomplete="username" value="{{ default_user }}">
-          </div>
-          <div class="field">
-            <label for="password">Mot de passe</label>
-            <input id="password" name="password" type="password" autocomplete="current-password">
-          </div>
-          {% if error %}
-          <div class="error">{{ error }}</div>
-          {% endif %}
-          <button class="btn" type="submit">Se connecter</button>
-        </form>
-        <div class="footer">
-          © {{ title }} · Secure Panel
-        </div>
-      </section>
-    </div>
+    <form method="post">
+      <div class="field">
+        <label>Username</label>
+        <input type="text" name="username" value="{{ default_user }}">
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" name="password">
+      </div>
+      <button class="btn" type="submit">Sign in</button>
+    </form>
+
+    {% if error %}
+      <div class="error">{{ error }}</div>
+    {% endif %}
   </div>
 </body>
 </html>
 """
 
-# ---- LAYOUT : thème dashboard corporate ----
+# ---- LAYOUT : même structure, néon + même “check proxies” ----
 LAYOUT_TEMPLATE = """
 {% macro nav_link(href, label, active_name) -%}
   <a href="{{ href }}" class="nav-link {{ 'active' if active == active_name else '' }}">{{ label }}</a>
@@ -535,23 +394,25 @@ LAYOUT_TEMPLATE = """
   <style>
     :root {
       --bg-main: #020617;
-      --bg-elevated: #020617;
       --text-main: #e5e7eb;
       --text-muted: #9ca3af;
-      --accent-primary: #2563eb;
-      --accent-primary-soft: rgba(37,99,235,0.18);
-      --accent-secondary: #38bdf8;
+      --accent-primary: #0ea5e9;   /* cyan */
+      --accent-secondary: #a855f7; /* violet */
+      --accent-tertiary: #22c55e;  /* vert néon */
       --accent-ok: #22c55e;
-      --accent-fail: #f97316;
+      --accent-fail: #fb923c;
       --accent-warn: #eab308;
     }
     * { box-sizing:border-box; }
     body {
       margin:0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      /* même photo de fond que login */
       background-image:
-        linear-gradient(140deg, rgba(15,23,42,0.94), rgba(15,23,42,0.96)),
-        url("https://images.pexels.com/photos/325229/pexels-photo-325229.jpeg?auto=compress&cs=tinysrgb&w=1600");
+        radial-gradient(circle at 0% 0%, rgba(14,165,233,0.20), transparent 60%),
+        radial-gradient(circle at 100% 0%, rgba(168,85,247,0.18), transparent 60%),
+        linear-gradient(180deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
+        url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
       background-size: cover;
       background-position: center;
       background-attachment: fixed;
@@ -559,19 +420,9 @@ LAYOUT_TEMPLATE = """
       min-height:100vh;
     }
     .shell {
-      max-width:1120px;
-      margin:20px auto 32px;
-      padding:18px 20px 30px;
-      border-radius:22px;
-      background:
-        radial-gradient(circle at top left, rgba(37,99,235,0.18), transparent 58%),
-        radial-gradient(circle at bottom right, rgba(56,189,248,0.12), transparent 60%),
-        linear-gradient(130deg, rgba(15,23,42,0.96), rgba(15,23,42,0.98));
-      border:1px solid rgba(148,163,184,0.4);
-      box-shadow:
-        0 18px 60px rgba(0,0,0,0.9),
-        0 0 0 1px rgba(15,23,42,0.9);
-      backdrop-filter: blur(10px);
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 18px 20px 30px;
     }
     header {
       display:flex;
@@ -591,7 +442,10 @@ LAYOUT_TEMPLATE = """
       text-transform:uppercase;
     }
     .brand-title span {
-      color:#60a5fa;
+      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
+      -webkit-background-clip:text;
+      background-clip:text;
+      color:transparent;
     }
     .brand-sub {
       font-size:11px;
@@ -601,48 +455,42 @@ LAYOUT_TEMPLATE = """
       display:flex;
       gap:10px;
       align-items:center;
-      font-size:13px;
     }
     .nav-link {
-      position:relative;
+      font-size:13px;
       padding:7px 14px;
       border-radius:999px;
-      text-decoration:none;
       color:#e5e7eb;
-      border:1px solid transparent;
-      background:rgba(15,23,42,0.6);
+      text-decoration:none;
+      border:1px solid rgba(148,163,184,0.45);
+      background:rgba(15,23,42,0.86);
+      box-shadow:0 0 0 1px rgba(15,23,42,0.9);
     }
-    .nav-link::before {
-      content:"";
-      position:absolute;
-      inset:0;
-      border-radius:999px;
-      background:radial-gradient(circle at top left, rgba(59,130,246,0.3), transparent 60%);
-      opacity:0;
-      transition:opacity .15s ease;
-      z-index:-1;
-    }
-    .nav-link:hover::before {
-      opacity:1;
+    .nav-link:hover {
+      border-color:var(--accent-primary);
+      box-shadow:0 0 14px rgba(14,165,233,0.7);
     }
     .nav-link.active {
-      border-color:rgba(59,130,246,0.9);
-      background:radial-gradient(circle at top left, rgba(59,130,246,0.45), transparent 62%);
-      box-shadow:0 12px 30px rgba(59,130,246,0.6);
+      color:#0b1120;
+      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
+      border-color:transparent;
+      box-shadow:
+        0 0 18px rgba(14,165,233,0.9),
+        0 0 28px rgba(168,85,247,0.7);
     }
     .logout-link {
-      margin-left:6px;
-      padding:6px 12px;
-      border-radius:999px;
       font-size:12px;
-      border:1px solid rgba(148,163,184,0.4);
+      padding:7px 11px;
+      border-radius:999px;
+      border:1px solid rgba(148,163,184,0.45);
+      background:rgba(15,23,42,0.9);
       color:var(--text-muted);
       text-decoration:none;
-      background:rgba(15,23,42,0.8);
     }
     .logout-link:hover {
+      border-color:var(--accent-secondary);
       color:#f9fafb;
-      border-color:rgba(248,250,252,0.4);
+      box-shadow:0 0 14px rgba(168,85,247,0.7);
     }
 
     h2 {
@@ -658,12 +506,16 @@ LAYOUT_TEMPLATE = """
     }
     .card {
       background:
-        radial-gradient(circle at top left, rgba(37,99,235,0.10), transparent 55%),
-        linear-gradient(to bottom right, #020617, #020617);
-      border-radius:16px;
+        radial-gradient(circle at top left, rgba(14,165,233,0.20), transparent 55%),
+        radial-gradient(circle at bottom right, rgba(168,85,247,0.18), transparent 55%),
+        rgba(15,23,42,0.92);
+      border-radius:18px;
       padding:16px 18px;
-      border:1px solid rgba(148,163,184,0.32);
-      box-shadow:0 20px 60px rgba(15,23,42,1);
+      border:1px solid rgba(59,130,246,0.6);
+      box-shadow:
+        0 0 26px rgba(14,165,233,0.45),
+        0 24px 70px rgba(0,0,0,0.9);
+      backdrop-filter: blur(4px);
     }
     .card h3 {
       margin:0 0 6px;
@@ -675,22 +527,8 @@ LAYOUT_TEMPLATE = """
       font-weight:600;
     }
     .muted {
-      color:var(--text-muted);
       font-size:12px;
-    }
-    .pill {
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-      padding:4px 9px;
-      border-radius:999px;
-      border:1px solid rgba(148,163,184,0.4);
-      font-size:11px;
-    }
-    .pill-dot {
-      width:8px;
-      height:8px;
-      border-radius:999px;
+      color:var(--text-muted);
     }
 
     table {
@@ -701,117 +539,116 @@ LAYOUT_TEMPLATE = """
     th, td {
       padding:8px 10px;
       text-align:left;
-      border-bottom:1px solid rgba(30,41,59,0.9);
+      border-bottom:1px solid rgba(31,41,55,0.9);
     }
     th {
-      font-size:12px;
-      color:var(--text-muted);
+      font-size:11px;
       text-transform:uppercase;
-      letter-spacing:.05em;
-      background:rgba(15,23,42,0.95);
-      position:sticky;
-      top:0;
-      z-index:1;
-    }
-    tr:nth-child(even) td {
-      background:rgba(15,23,42,0.85);
+      letter-spacing:.08em;
+      color:var(--text-muted);
     }
     tr:hover td {
-      background:rgba(15,23,42,1);
+      background:rgba(15,23,42,0.9);
     }
 
-    .badge {
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-      padding:4px 9px;
+    .pill {
+      display:inline-block;
+      padding:3px 8px;
       border-radius:999px;
       font-size:11px;
-      background:rgba(15,23,42,0.95);
-      border:1px solid rgba(148,163,184,0.4);
-    }
-    .status-dot {
-      width:8px;
-      height:8px;
-      border-radius:999px;
-    }
-    .status-ok {
-      background:#22c55e;
-      box-shadow:0 0 0 4px rgba(34,197,94,0.4);
-    }
-    .status-fail {
-      background:#f97316;
-      box-shadow:0 0 0 4px rgba(248,113,113,0.35);
+      border:1px solid rgba(148,163,184,0.6);
+      color:#e5e7eb;
+      background:rgba(15,23,42,0.96);
     }
 
     .btn {
       display:inline-flex;
       align-items:center;
       justify-content:center;
-      gap:6px;
-      font-size:13px;
+      padding:7px 15px;
       border-radius:999px;
-      border:1px solid transparent;
-      padding:6px 12px;
+      border:none;
       cursor:pointer;
-      text-decoration:none;
-      background:linear-gradient(135deg,#2563eb,#22c55e);
-      color:#f9fafb;
-      box-shadow:0 14px 38px rgba(37,99,235,0.65);
+      font-size:13px;
+      color:#020617;
+      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary),var(--accent-tertiary));
+      box-shadow:
+        0 0 22px rgba(14,165,233,0.9),
+        0 0 32px rgba(168,85,247,0.7);
     }
+    .btn:hover { filter:brightness(1.06); }
+
     .btn-secondary {
-      background:rgba(15,23,42,0.95);
-      border-color:rgba(148,163,184,0.4);
-      box-shadow:none;
+      background:rgba(15,23,42,0.96);
+      border:1px solid rgba(148,163,184,0.7);
       color:var(--text-main);
+      box-shadow:none;
     }
-    .btn-danger {
-      background:linear-gradient(135deg,#b91c1c,#f97316);
-      box-shadow:0 14px 38px rgba(185,28,28,0.75);
-    }
-
-    .btn-small {
-      padding:4px 9px;
-      font-size:12px;
+    .btn-secondary:hover {
+      border-color:var(--accent-primary);
+      box-shadow:0 0 16px rgba(14,165,233,0.7);
     }
 
-    .table-actions {
-      display:flex;
-      gap:6px;
+    .status-badge {
+      padding:3px 9px;
+      border-radius:999px;
+      font-size:11px;
+      font-weight:500;
+      border:1px solid transparent;
+    }
+    .status-ok {
+      background:rgba(34,197,94,0.16);
+      color:#bbf7d0;
+      border-color:rgba(34,197,94,0.8);
+      box-shadow:0 0 10px rgba(34,197,94,0.7);
+    }
+    .status-fail {
+      background:rgba(248,113,113,0.16);
+      color:#fed7aa;
+      border-color:rgba(248,113,113,0.9);
+      box-shadow:0 0 10px rgba(248,113,113,0.7);
+    }
+    .status-unknown {
+      background:rgba(148,163,184,0.18);
+      color:#e5e7eb;
+      border-color:rgba(148,163,184,0.9);
+    }
+    .status-checking {
+      background:rgba(234,179,8,0.18);
+      color:#facc15;
+      border-color:rgba(234,179,8,0.9);
+      box-shadow:0 0 10px rgba(250,204,21,0.7);
     }
 
     .form-row {
       display:flex;
       flex-wrap:wrap;
-      gap:10px;
+      gap:12px;
       margin-bottom:12px;
-      align-items:flex-end;
     }
     .form-row label {
-      display:block;
       font-size:12px;
       color:var(--text-muted);
-      margin-bottom:4px;
+      display:block;
+      margin-bottom:3px;
     }
-    .form-row input,
-    .form-row select {
+    .form-row input {
       border-radius:999px;
-      border:1px solid rgba(148,163,184,0.4);
-      background:rgba(15,23,42,0.98);
+      border:1px solid rgba(51,65,85,0.9);
+      background:rgba(2,6,23,0.96);
       color:#e5e7eb;
-      padding:7px 10px;
-      min-width:120px;
+      padding:7px 12px;
+      min-width:140px;
       font-size:13px;
     }
-    .form-row input:focus,
-    .form-row select:focus {
+    .form-row input:focus {
       outline:none;
       border-color:var(--accent-primary);
-      box-shadow:0 0 0 1px rgba(37,99,235,0.5);
+      box-shadow:0 0 0 1px rgba(14,165,233,0.6);
     }
 
     .error-msg {
-      color:var(--accent-fail);
+      color:#fb7185;
       font-size:12px;
       margin-top:4px;
     }
@@ -821,6 +658,7 @@ LAYOUT_TEMPLATE = """
       font-size:11px;
       color:var(--text-muted);
       text-align:center;
+      text-shadow:0 0 10px rgba(15,23,42,0.9);
     }
 
     .progress-wrapper {
@@ -828,59 +666,28 @@ LAYOUT_TEMPLATE = """
       font-size:12px;
       color:var(--text-muted);
     }
-    .progress-bar-bg {
-      margin-top:6px;
+    .progress-bar-outer {
       width:100%;
-      height:6px;
+      height:7px;
       border-radius:999px;
-      background:rgba(15,23,42,0.9);
-      overflow:hidden;
-      border:1px solid rgba(30,64,175,0.8);
-    }
-    .progress-bar-fill {
-      height:100%;
-      border-radius:999px;
-      background:linear-gradient(90deg,#2563eb,#22c55e);
-    }
-
-    @media (max-width: 768px) {
-      header {
-        flex-direction:column;
-        align-items:flex-start;
-        gap:10px;
-      }
-      nav {
-        flex-wrap:wrap;
-        justify-content:flex-start;
-      }
-      .shell {
-        margin:12px;
-        padding:14px 12px 22px;
-      }
-      th, td {
-        padding:6px 6px;
-      }
-    }
-
-    .pre-proxies {
-      width:100%;
-      min-height:260px;
-      border-radius:16px;
-      border:1px solid rgba(30,64,175,0.8);
       background:rgba(15,23,42,0.96);
-      padding:10px;
-      color:#e5e7eb;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size:12px;
-      resize:vertical;
-    }
-
-    .clipboard-info {
+      overflow:hidden;
       margin-top:6px;
-      font-size:11px;
-      color:var(--text-muted);
+      border:1px solid rgba(31,41,55,0.9);
+      box-shadow:0 0 14px rgba(14,165,233,0.6);
+    }
+    .progress-bar-inner {
+      height:100%;
+      width:0%;
+      border-radius:999px;
+      background:linear-gradient(90deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
+      transition:width .18s ease-out;
     }
 
+    @media (max-width: 680px) {
+      header { flex-direction:column; align-items:flex-start; gap:10px; }
+      .shell { padding:14px 14px 24px; }
+    }
   </style>
 </head>
 <body>
@@ -908,6 +715,7 @@ LAYOUT_TEMPLATE = """
 </body>
 </html>
 """
+
 
 # =============================
 # Routes
@@ -966,20 +774,12 @@ def dashboard():
         <div class="card">
           <h3>Clients</h3>
           <div class="big">{{ stats.clients_count }}</div>
-          <div class="muted">Configured clients</div>
+          <div class="muted">Each client download has its own text file.</div>
         </div>
-      </div>
-
-      <div class="progress-wrapper">
-        <div>Usage of proxy pool</div>
-        {% set total = stats.total_proxies if stats.total_proxies > 0 else 1 %}
-        {% set used = stats.assigned_proxies %}
-        {% set pct = (used * 100) // total %}
-        <div class="progress-bar-bg">
-          <div class="progress-bar-fill" style="width: {{ pct }}%;"></div>
-        </div>
-        <div class="muted" style="margin-top:4px;">
-          {{ used }} / {{ total }} proxies assigned ({{ pct }}%)
+        <div class="card">
+          <h3>Pool status</h3>
+          <div class="muted">Master proxy file:<br><code>{{ stats.proxy_source }}</code></div>
+          <div class="muted" style="margin-top:6px;">Database file:<br><code>{{ stats.db_file }}</code></div>
         </div>
       </div>
     """, stats=stats)
@@ -987,9 +787,9 @@ def dashboard():
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Dashboard",
+        body=body,
         active="dashboard",
         stats=stats,
-        body=body,
     )
 
 
@@ -1006,152 +806,165 @@ def clients():
         try:
             count = int(count_str)
         except ValueError:
-            count = -1
+            count = 0
+
         if not name:
-            error = "Client name cannot be empty."
+            error = "Client name is required."
         elif count <= 0:
-            error = "Proxy count must be a positive integer."
+            error = "Number of proxies must be a positive integer."
         else:
-            db["clients"][name] = {"count": count}
-            save_db(db)
-            assign_proxies_evenly()
-            return redirect(url_for("clients"))
+            all_proxies = load_proxy_list()
+            assigned = set(db["assigned_proxies"].keys())
+            available = [p for p in all_proxies if p not in assigned]
+
+            if len(available) < count:
+                error = f"Not enough available proxies. Requested {count}, only {len(available)} left."
+            else:
+                selected = available[:count]
+                client_id = next_client_id(db)
+                created_at = datetime.datetime.now().isoformat(timespec="seconds")
+                client = {
+                    "id": client_id,
+                    "name": name,
+                    "count": count,
+                    "proxies": selected,
+                    "created_at": created_at,
+                }
+                db["clients"].append(client)
+                for p in selected:
+                    db["assigned_proxies"][p] = client_id
+                save_db(db)
+
+                filename = f"{name}_{count}proxies.txt"
+                content = "\n".join(selected) + "\n"
+                mem = BytesIO(content.encode("utf-8"))
+                mem.seek(0)
+                return send_file(
+                    mem,
+                    as_attachment=True,
+                    download_name=filename,
+                    mimetype="text/plain",
+                )
+
+    db = get_db()
+    clients_list = sorted(db["clients"], key=lambda c: c["id"])
 
     body = render_template_string("""
       <h2>Clients</h2>
-      {% if error %}
-        <div class="error-msg">{{ error }}</div>
-      {% endif %}
-      <form method="post" style="margin-bottom:14px;">
-        <div class="form-row">
-          <div>
-            <label for="name">Client name</label>
-            <input id="name" name="name" placeholder="Client name">
-          </div>
-          <div>
-            <label for="count">Proxy count</label>
-            <input id="count" name="count" type="number" min="1" placeholder="Example: 10">
-          </div>
-          <div>
-            <button class="btn" type="submit">Add client</button>
+      <div class="grid">
+        <div class="card">
+          <h3>Create new client</h3>
+          <form method="post">
+            <div class="form-row">
+              <div>
+                <label>Client name</label>
+                <input type="text" name="name" placeholder="e.g. Mohamed">
+              </div>
+              <div>
+                <label>Number of proxies</label>
+                <input type="number" name="count" min="1" placeholder="10">
+              </div>
+            </div>
+            {% if error %}
+              <div class="error-msg">{{ error }}</div>
+            {% endif %}
+            <button class="btn" type="submit">Create & download .txt</button>
+            <div class="muted" style="margin-top:8px;">
+              Available proxies: <strong>{{ stats.available_proxies }}</strong>
+            </div>
+          </form>
+        </div>
+
+        <div class="card">
+          <h3>Summary</h3>
+          <div class="muted">
+            Total clients: <strong>{{ stats.clients_count }}</strong><br>
+            Total proxies: <strong>{{ stats.total_proxies }}</strong><br>
+            Assigned: <span style="color:#fed7aa;">{{ stats.assigned_proxies }}</span><br>
+            Available: <span style="color:#bbf7d0;">{{ stats.available_proxies }}</span>
           </div>
         </div>
-      </form>
+      </div>
 
-      <div class="card">
+      <div class="card" style="margin-top:16px;">
         <h3>Existing clients</h3>
-        {% if not db.clients %}
-          <div class="muted">No clients configured yet.</div>
+        {% if not clients %}
+          <div class="muted">No clients yet.</div>
         {% else %}
           <table>
             <thead>
               <tr>
-                <th>Client</th>
-                <th>Proxy count</th>
-                <th>Assigned proxies</th>
+                <th>ID</th>
+                <th>Name</th>
+                <th>Proxies</th>
+                <th>Created</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-            {% for name, info in db.clients.items() %}
-              {% set assigned = db.assignments.values()|list %}
-              {% set assigned_count = assigned|select("equalto", name)|list|length %}
-              <tr>
-                <td>{{ name }}</td>
-                <td>{{ info.count }}</td>
-                <td>
-                  <span class="badge">
-                    <span class="status-dot status-ok"></span>
-                    {{ assigned_count }}
-                  </span>
-                </td>
-                <td>
-                  <div class="table-actions">
-                    <a class="btn btn-small btn-secondary" href="{{ url_for('client_proxies_view', client_name=name) }}">View proxies</a>
-                    <a class="btn btn-small btn-secondary" href="{{ url_for('client_proxies_download', client_name=name) }}">Download</a>
-                    <a class="btn btn-small btn-danger" href="{{ url_for('delete_client', client_name=name) }}" onclick="return confirm('Delete this client?');">Delete</a>
-                  </div>
-                </td>
-              </tr>
-            {% endfor %}
+              {% for c in clients %}
+                <tr>
+                  <td>#{{ c.id }}</td>
+                  <td>{{ c.name }}</td>
+                  <td>{{ c.count }}</td>
+                  <td>{{ c.created_at }}</td>
+                  <td>
+                    <a class="btn-secondary" href="{{ url_for('download_client', client_id=c.id) }}">Download</a>
+                    <form method="post" action="{{ url_for('delete_client', client_id=c.id) }}" style="display:inline;" onsubmit="return confirm('Delete this client and free its proxies?');">
+                      <button class="btn-secondary" type="submit" style="margin-left:6px;">Delete</button>
+                    </form>
+                  </td>
+                </tr>
+              {% endfor %}
             </tbody>
           </table>
         {% endif %}
       </div>
-    """, db=db, error=error)
+    """, stats=stats, clients=clients_list, error=error)
     return render_template_string(
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Clients",
+        body=body,
         active="clients",
         stats=stats,
-        body=body,
     )
 
 
-@app.route("/clients/<client_name>/proxies")
+@app.route("/clients/<int:client_id>/download")
 @login_required
-def client_proxies_view(client_name):
-    stats = compute_stats()
+def download_client(client_id):
     db = get_db()
-    if client_name not in db["clients"]:
+    client = next((c for c in db["clients"] if c["id"] == client_id), None)
+    if not client:
         abort(404)
-    proxies = get_client_proxies(client_name)
-    lines = [p[1] for p in proxies]
-    text_block = "\n".join(lines)
-    body = render_template_string("""
-      <h2>Proxies for client: {{ client_name }}</h2>
-      <div class="card">
-        <h3>Proxy list</h3>
-        <textarea class="pre-proxies" readonly id="proxyText">{{ text_block }}</textarea>
-        <div class="clipboard-info">
-          <button class="btn btn-small" type="button" onclick="copyProxies()">Copy to clipboard</button>
-        </div>
-      </div>
-      <script>
-        function copyProxies() {
-          var el = document.getElementById("proxyText");
-          el.select();
-          document.execCommand("copy");
-          alert("Proxies copied to clipboard.");
-        }
-      </script>
-    """, client_name=client_name, text_block=text_block)
-    return render_template_string(
-        LAYOUT_TEMPLATE,
-        title=APP_TITLE,
-        page_title=f"Client {client_name}",
-        active="clients",
-        stats=stats,
-        body=body,
+    filename = f"{client['name']}_{client['count']}proxies.txt"
+    content = "\n".join(client["proxies"]) + "\n"
+    mem = BytesIO(content.encode("utf-8"))
+    mem.seek(0)
+    return send_file(
+        mem,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="text/plain",
     )
 
 
-@app.route("/clients/<client_name>/download")
+@app.route("/clients/<int:client_id>/delete", methods=["POST"])
 @login_required
-def client_proxies_download(client_name):
+def delete_client(client_id):
     db = get_db()
-    if client_name not in db["clients"]:
-        abort(404)
-    proxies = get_client_proxies(client_name)
-    lines = [p[1] for p in proxies]
-    text_block = "\n".join(lines)
-
-    tmp_path = f"/tmp/proxies_{client_name}.txt"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(text_block)
-    return send_file(tmp_path, as_attachment=True, download_name=f"{client_name}_proxies.txt")
-
-
-@app.route("/clients/<client_name>/delete")
-@login_required
-def delete_client(client_name):
-    db = get_db()
-    if client_name in db["clients"]:
-        del db["clients"][client_name]
-        db["assignments"] = {pid: c for pid, c in db["assignments"].items() if c != client_name}
-        save_db(db)
-        assign_proxies_evenly()
+    new_clients = []
+    removed_proxies = []
+    for c in db["clients"]:
+        if c["id"] == client_id:
+            removed_proxies.extend(c.get("proxies", []))
+        else:
+            new_clients.append(c)
+    db["clients"] = new_clients
+    for p in removed_proxies:
+        db["assigned_proxies"].pop(p, None)
+    save_db(db)
     return redirect(url_for("clients"))
 
 
@@ -1159,165 +972,278 @@ def delete_client(client_name):
 @login_required
 def proxies():
     stats = compute_stats()
+    all_proxies = load_proxy_list()
     db = get_db()
-    proxies = load_all_proxies()
-    assignments = db["assignments"]
-    rows = []
-    for p in proxies:
-        pid = f"{p['host']}:{p['port']}"
-        client_name = assignments.get(pid)
-        rows.append((pid, build_proxy_url(p), client_name))
+    assigned_map = db["assigned_proxies"]
+
+    table_data = []
+    for p in all_proxies:
+        client_id = assigned_map.get(p)
+        table_data.append({
+            "proxy": p,
+            "client_id": client_id,
+        })
 
     body = render_template_string("""
-      <h2>Proxy pool</h2>
-      <div class="card">
-        {% if not rows %}
-          <div class="muted">No proxies loaded. Configure "proxy_source" in settings.</div>
-        {% else %}
-          <table>
-            <thead>
-              <tr>
-                <th>Proxy ID</th>
-                <th>URL</th>
-                <th>Assigned client</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for pid, url, client_name in rows %}
-              <tr>
-                <td>{{ pid }}</td>
-                <td style="font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;">
-                  {{ url }}
-                </td>
+      <h2>Proxies</h2>
+      <div class="card" style="margin-bottom:16px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+          <div class="muted">
+            Total: <strong>{{ stats.total_proxies }}</strong> ·
+            Available: <span style="color:#bbf7d0;">{{ stats.available_proxies }}</span> ·
+            Assigned: <span style="color:#fed7aa;">{{ stats.assigned_proxies }}</span>
+          </div>
+          <button class="btn" id="check-all-btn">Check ALL Proxies</button>
+        </div>
+        <div class="muted" style="margin-top:4px;font-size:11px;">
+          Performs an HTTPS request to Google using each proxy (timeout {{ timeout }}s).
+        </div>
+
+        <div id="progress-wrapper" class="progress-wrapper" style="display:none;">
+          <div>
+            <span id="progress-label">0%</span>
+            &nbsp;·&nbsp;
+            <span id="progress-detail">Waiting…</span>
+          </div>
+          <div class="progress-bar-outer">
+            <div class="progress-bar-inner" id="progress-bar"></div>
+          </div>
+        </div>
+
+        <div id="check-summary" class="muted" style="margin-top:8px;font-size:12px;display:none;">
+          Last check:
+          <span id="sum-ok" style="color:#bbf7d0;">0 OK</span>
+          &nbsp;·&nbsp;
+          <span id="sum-fail" style="color:#fed7aa;">0 Failed</span>
+        </div>
+      </div>
+
+      <div class="card" style="max-height:480px;overflow:auto;">
+        <table id="proxy-table">
+          <thead>
+            <tr>
+              <th>Proxy</th>
+              <th>Assigned to</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in rows %}
+              <tr data-proxy="{{ row.proxy }}">
+                <td class="proxy-cell"><code>{{ row.proxy }}</code></td>
                 <td>
-                  {% if client_name %}
-                    <span class="badge">
-                      <span class="status-dot status-ok"></span>
-                      {{ client_name }}
-                    </span>
+                  {% if row.client_id %}
+                    <span class="pill">Client #{{ row.client_id }}</span>
                   {% else %}
-                    <span class="badge">
-                      <span class="status-dot status-fail"></span>
-                      Unassigned
-                    </span>
+                    <span class="muted">Unassigned</span>
                   {% endif %}
                 </td>
+                <td class="status-cell">
+                  <span class="status-badge status-unknown">UNKNOWN</span>
+                </td>
               </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% endif %}
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
-    """, rows=rows)
+
+      <script>
+        const checkBtn = document.getElementById('check-all-btn');
+        const table = document.getElementById('proxy-table');
+        const summaryDiv = document.getElementById('check-summary');
+        const sumOkSpan = document.getElementById('sum-ok');
+        const sumFailSpan = document.getElementById('sum-fail');
+        const progressWrapper = document.getElementById('progress-wrapper');
+        const progressBar = document.getElementById('progress-bar');
+        const progressLabel = document.getElementById('progress-label');
+        const progressDetail = document.getElementById('progress-detail');
+
+        function setStatus(proxy, status) {
+          const row = table.querySelector('tr[data-proxy="' + proxy.replace(/"/g,'&quot;') + '"]');
+          if (!row) return;
+          const cell = row.querySelector('.status-cell');
+          if (!cell) return;
+
+          let label = '';
+          let cls = 'status-badge ';
+
+          if (status === 'checking') {
+            label = 'CHECKING';
+            cls += 'status-checking';
+          } else if (status === 'ok') {
+            label = 'STATUS OK';
+            cls += 'status-ok';
+          } else if (status === 'fail') {
+            label = 'STATUS FAIL';
+            cls += 'status-fail';
+          } else {
+            label = 'UNKNOWN';
+            cls += 'status-unknown';
+          }
+          cell.innerHTML = '<span class="' + cls + '">' + label + '</span>';
+        }
+
+        async function runCheckAll() {
+          const rows = Array.from(table.querySelectorAll('tbody tr'));
+          const total = rows.length;
+          if (!total) return;
+
+          let okCount = 0;
+          let failCount = 0;
+
+          progressWrapper.style.display = 'block';
+          summaryDiv.style.display = 'none';
+          progressBar.style.width = '0%';
+          progressLabel.textContent = '0%';
+          progressDetail.textContent = 'Starting...';
+
+          rows.forEach(row => {
+            const proxy = row.getAttribute('data-proxy');
+            setStatus(proxy, 'checking');
+          });
+
+          for (let i = 0; i < total; i++) {
+            const row = rows[i];
+            const proxy = row.getAttribute('data-proxy');
+            progressDetail.textContent = 'Checking ' + (i + 1) + ' / ' + total;
+
+            try {
+              const resp = await fetch('{{ url_for("proxies_check_one") }}', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: JSON.stringify({ proxy: proxy })
+              });
+              const data = await resp.json();
+              const status = (data && data.status === 'ok') ? 'ok' : 'fail';
+              if (status === 'ok') okCount++; else failCount++;
+              setStatus(proxy, status);
+            } catch (e) {
+              failCount++;
+              setStatus(proxy, 'fail');
+            }
+
+            const pct = Math.round(((i + 1) / total) * 100);
+            progressBar.style.width = pct + '%';
+            progressLabel.textContent = pct + '%';
+          }
+
+          progressDetail.textContent = 'Completed';
+          summaryDiv.style.display = 'block';
+          sumOkSpan.textContent = okCount + ' OK';
+          sumFailSpan.textContent = failCount + ' Failed';
+        }
+
+        if (checkBtn) {
+          checkBtn.addEventListener('click', () => {
+            runCheckAll();
+          });
+        }
+      </script>
+    """, stats=stats, rows=table_data, timeout=CHECK_TIMEOUT)
     return render_template_string(
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Proxies",
+        body=body,
         active="proxies",
         stats=stats,
-        body=body,
     )
+
+
+@app.route("/proxies/check-one", methods=["POST"])
+@login_required
+def proxies_check_one():
+    """
+    Vérifie un seul proxy (appelé en boucle par le JS).
+    """
+    data = request.get_json(silent=True) or {}
+    proxy_line = (data.get("proxy") or "").strip()
+    if not proxy_line:
+        return jsonify({"status": "fail", "error": "no proxy"}), 400
+
+    ok = check_proxy(proxy_line)
+    return jsonify({"status": "ok" if ok else "fail"})
 
 
 @app.route("/settings", methods=["GET", "POST"])
 @login_required
 def settings():
-    cfg = get_config()
     stats = compute_stats()
+    cfg = get_config()
+    msg = None
     error = None
 
     if request.method == "POST":
-        listen_host = request.form.get("listen_host", "").strip()
-        listen_port_str = request.form.get("listen_port", "").strip()
-        proxy_source = request.form.get("proxy_source", "").strip()
-        db_file = request.form.get("db_file", "").strip()
-        new_user = request.form.get("admin_username", "").strip()
-        new_pass = request.form.get("admin_password", "")
-
-        try:
-            listen_port = int(listen_port_str)
-        except ValueError:
-            listen_port = None
-
-        if not listen_host or listen_port is None:
-            error = "Invalid host/port."
+        new_user = request.form.get("username", "").strip()
+        new_pass = request.form.get("password", "")
+        confirm = request.form.get("confirm", "")
+        if new_pass and new_pass != confirm:
+            error = "Password confirmation does not match."
         else:
-            cfg["listen_host"] = listen_host
-            cfg["listen_port"] = listen_port
-            if proxy_source:
-                cfg["proxy_source"] = proxy_source
-            if db_file:
-                cfg["db_file"] = db_file
-            if new_user:
-                cfg["admin_username"] = new_user
-            if new_pass:
-                cfg["password_hash"] = generate_password_hash(new_pass)
-            save_config(cfg)
-            return redirect(url_for("settings"))
+            set_admin_password(new_user or cfg["admin_username"], new_pass or None)
+            msg = "Settings updated."
+            cfg = get_config()
 
     body = render_template_string("""
       <h2>Settings</h2>
-      {% if error %}
-        <div class="error-msg">{{ error }}</div>
-      {% endif %}
       <div class="card">
+        <h3>Admin account</h3>
         <form method="post">
           <div class="form-row">
             <div>
-              <label for="listen_host">Listen host</label>
-              <input id="listen_host" name="listen_host" value="{{ cfg.listen_host }}">
-            </div>
-            <div>
-              <label for="listen_port">Listen port</label>
-              <input id="listen_port" name="listen_port" type="number" value="{{ cfg.listen_port }}">
-            </div>
-          </div>
-          <div class="form-row">
-            <div style="flex:1;">
-              <label for="proxy_source">Proxy source file</label>
-              <input id="proxy_source" name="proxy_source" value="{{ cfg.proxy_source }}">
-            </div>
-          </div>
-          <div class="form-row">
-            <div style="flex:1;">
-              <label for="db_file">DB file</label>
-              <input id="db_file" name="db_file" value="{{ cfg.db_file }}">
+              <label>Username</label>
+              <input type="text" name="username" value="{{ cfg.admin_username }}">
             </div>
           </div>
           <div class="form-row">
             <div>
-              <label for="admin_username">Admin username</label>
-              <input id="admin_username" name="admin_username" value="{{ cfg.admin_username }}">
+              <label>New password (optional)</label>
+              <input type="password" name="password" placeholder="Leave blank to keep current">
             </div>
             <div>
-              <label for="admin_password">New admin password (optional)</label>
-              <input id="admin_password" name="admin_password" type="password" placeholder="Leave blank to keep current">
+              <label>Confirm password</label>
+              <input type="password" name="confirm" placeholder="Repeat new password">
             </div>
           </div>
+          {% if error %}
+            <div class="error-msg">{{ error }}</div>
+          {% endif %}
+          {% if msg %}
+            <div class="muted" style="color:#bbf7d0;margin-top:4px;">{{ msg }}</div>
+          {% endif %}
           <button class="btn" type="submit" style="margin-top:8px;">Save settings</button>
         </form>
       </div>
-    """, cfg=cfg, error=error)
+    """, cfg=cfg, msg=msg, error=error)
     return render_template_string(
         LAYOUT_TEMPLATE,
         title=APP_TITLE,
         page_title="Settings",
+        body=body,
         active="settings",
         stats=stats,
-        body=body,
     )
 
 
+# =============================
+# Lancement
+# =============================
+
 def main():
-    cfg = get_config()
-    host = cfg.get("listen_host", "0.0.0.0")
-    port = cfg.get("listen_port", 1991)
-    try:
-        port = int(port)
-    except Exception:
-        port = 1991
-    print(f"[{datetime.datetime.now().isoformat()}] Starting {APP_TITLE} on {host}:{port}")
-    app.run(host=host, port=port, debug=False)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Simple proxy management panel")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=1991)
+    args = parser.parse_args()
+
+    ensure_config()
+    ensure_db()
+
+    app.run(host=args.host, port=args.port, debug=False)
 
 
 if __name__ == "__main__":
