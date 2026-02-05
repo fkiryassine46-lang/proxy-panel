@@ -245,38 +245,34 @@ LOGIN_TEMPLATE = """
     body {
       margin: 0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      /* Photo de datacenter + overlay néon */
+      /* fond data center bleu/violet */
       background-image:
-        radial-gradient(circle at top left, rgba(0, 245, 255, 0.25), transparent 55%),
-        radial-gradient(circle at bottom right, rgba(255, 45, 251, 0.22), transparent 55%),
-        linear-gradient(160deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
+        linear-gradient(135deg, rgba(15,23,42,0.92), rgba(30,64,175,0.92)),
         url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
       background-size: cover;
       background-position: center;
       background-attachment: fixed;
-      color: #e5e7eb;
-      height: 100vh;
+      min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
+      color: #0f172a;
     }
     .card {
       width: 380px;
-      border-radius: 24px;
-      padding: 28px 30px 26px;
+      border-radius: 26px;
+      padding: 26px 30px 26px;
       background:
-        radial-gradient(circle at top left, rgba(0,245,255,0.09), transparent 60%),
-        radial-gradient(circle at bottom right, rgba(255,45,251,0.10), transparent 60%),
-        rgba(15,23,42,0.96);
-      border: 1px solid rgba(59,130,246,0.6);
+        radial-gradient(circle at top left, rgba(129,140,248,0.22), transparent 60%),
+        radial-gradient(circle at bottom right, rgba(56,189,248,0.20), transparent 60%),
+        #ffffff;
+      border: 1px solid rgba(129,140,248,0.7);
       box-shadow:
-        0 0 40px rgba(0,245,255,0.55),
-        0 35px 90px rgba(0,0,0,0.95);
-      backdrop-filter: blur(6px);
-      text-align: left;
+        0 18px 40px rgba(15,23,42,0.85),
+        0 0 40px rgba(59,130,246,0.65);
     }
 
-    /* --- LOGO EAGLE au centre --- */
+    /* --- LOGO EAGLE (image) --- */
     .eagle-logo-wrap {
       display:flex;
       flex-direction:column;
@@ -284,39 +280,30 @@ LOGIN_TEMPLATE = """
       justify-content:center;
       margin-bottom:18px;
     }
-    .eagle-mark {
-      width:60px;
-      height:60px;
-      border-radius:20px;
-      background: radial-gradient(circle at 0% 0%, #22c55e, #0ea5e9 40%, #a855f7 85%);
+    .eagle-logo-img {
+      width:80px;
+      height:80px;
+      border-radius:24px;
+      object-fit:cover;
       box-shadow:
-        0 0 25px rgba(56,189,248,0.95),
-        0 0 35px rgba(168,85,247,0.85);
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      color:#0b1120;
-      font-weight:800;
-      font-size:22px;
-      letter-spacing:.12em;
-      text-transform:uppercase;
-    }
-    .eagle-mark span {
-      transform:translateY(1px);
+        0 0 20px rgba(251,191,36,0.8),
+        0 0 35px rgba(30,64,175,0.8);
+      border: 2px solid rgba(30,64,175,0.9);
+      background:#020617;
     }
     .eagle-text-main {
       margin-top:10px;
-      font-size:12px;
+      font-size:13px;
       letter-spacing:.32em;
       text-transform:uppercase;
-      color:#9ca3af;
+      color:#6b7280;
     }
     .eagle-text-sub {
       margin-top:4px;
-      font-size:13px;
-      letter-spacing:.16em;
+      font-size:14px;
+      letter-spacing:.18em;
       text-transform:uppercase;
-      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
+      background: linear-gradient(135deg,#3b82f6,#a855f7);
       -webkit-background-clip:text;
       background-clip:text;
       color:transparent;
@@ -325,31 +312,33 @@ LOGIN_TEMPLATE = """
     h1 {
       margin: 0 0 6px;
       font-size: 22px;
+      color:#0f172a;
     }
     .subtitle {
       font-size: 13px;
-      color: #9ca3af;
+      color: #6b7280;
       margin-bottom: 18px;
     }
     label {
       display: block;
       font-size: 13px;
-      color: #e5e7eb;
+      color: #111827;
       margin-bottom: 5px;
     }
     input {
       width: 100%;
       border-radius: 999px;
-      border: 1px solid rgba(30,64,175,0.9);
-      background: rgba(2,6,23,0.95);
-      color: #e5e7eb;
+      border: 1px solid rgba(148,163,184,0.9);
+      background: #f9fafb;
+      color: #0f172a;
       font-size: 14px;
       padding: 9px 12px;
       outline: none;
     }
     input:focus {
-      border-color: #0ea5e9;
-      box-shadow: 0 0 0 1px rgba(14,165,233,0.6), 0 0 12px rgba(56,189,248,0.7);
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 1px rgba(59,130,246,0.55);
+      background:#ffffff;
     }
     .field {
       margin-bottom: 14px;
@@ -362,27 +351,27 @@ LOGIN_TEMPLATE = """
       padding: 10px 0;
       font-size: 14px;
       font-weight: 600;
-      letter-spacing: .06em;
+      letter-spacing: .08em;
       text-transform: uppercase;
       cursor: pointer;
-      color: #0b1120;
-      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7);
+      color: #f9fafb;
+      background: linear-gradient(135deg,#3b82f6,#a855f7);
       box-shadow:
-        0 0 25px rgba(34,197,94,0.9),
-        0 0 40px rgba(14,165,233,0.8);
+        0 10px 24px rgba(59,130,246,0.7),
+        0 0 30px rgba(129,140,248,0.9);
     }
-    .btn:hover { filter: brightness(1.08); }
+    .btn:hover { filter: brightness(1.05); }
     .error {
       margin-top: 10px;
       font-size: 13px;
-      color: #fb7185;
+      color: #b91c1c;
     }
   </style>
 </head>
 <body>
   <div class="card">
     <div class="eagle-logo-wrap">
-      <div class="eagle-mark"><span>E</span></div>
+      <img src="/static/eagle_logo.png" alt="Eagle logo" class="eagle-logo-img">
       <div class="eagle-text-main">EAGLE</div>
       <div class="eagle-text-sub">Eagle Proxy Panel</div>
     </div>
@@ -424,27 +413,25 @@ LAYOUT_TEMPLATE = """
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     :root {
-      --bg-main: #020617;
-      --bg-elevated: #020617;
-      --text-main: #e5e7eb;
-      --text-muted: #9ca3af;
-      --accent-primary: #2563eb;
-      --accent-primary-soft: rgba(37,99,235,0.18);
-      --accent-secondary: #38bdf8;
-      --accent-ok: #22c55e;
-      --accent-fail: #f97316;
+      --bg-main: #0f172a;
+      --text-main: #0f172a;
+      --text-muted: #6b7280;
+      --accent-primary: #3b82f6;   /* bleu */
+      --accent-secondary: #a855f7; /* mauve */
+      --accent-ok: #16a34a;
+      --accent-fail: #b91c1c;
       --accent-warn: #eab308;
     }
     * { box-sizing:border-box; }
     body {
       margin:0;
       font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      background:
-        radial-gradient(circle at 0% 0%, rgba(37,99,235,0.16), transparent 60%),
-        radial-gradient(circle at 100% 0%, rgba(56,189,248,0.12), transparent 60%),
-        linear-gradient(180deg,#020617,#020617);
-      color:var(--text-main);
+      background-image:
+        radial-gradient(circle at 0% 0%, rgba(59,130,246,0.25), transparent 60%),
+        radial-gradient(circle at 100% 0%, rgba(168,85,247,0.20), transparent 60%),
+        linear-gradient(180deg, #0f172a, #020617);
       min-height:100vh;
+      color:var(--text-main);
     }
     .shell {
       max-width: 1280px;
@@ -457,24 +444,43 @@ LAYOUT_TEMPLATE = """
       justify-content:space-between;
       margin-bottom:18px;
     }
+
+    /* HEADER LOGO AVEC IMAGE */
     .brand {
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+    .eagle-header-logo {
+      width:32px;
+      height:32px;
+      border-radius:10px;
+      object-fit:cover;
+      box-shadow:
+        0 0 14px rgba(251,191,36,0.9),
+        0 0 24px rgba(37,99,235,0.8);
+      border:2px solid rgba(37,99,235,0.9);
+      background:#020617;
+    }
+    .eagle-header-text {
       display:flex;
       flex-direction:column;
       gap:2px;
     }
-    .brand-title {
-      font-weight:700;
-      letter-spacing:.2em;
-      font-size:12px;
+    .eagle-header-title {
+      font-size:13px;
+      letter-spacing:.20em;
       text-transform:uppercase;
+      background: linear-gradient(135deg,#3b82f6,#a855f7);
+      -webkit-background-clip:text;
+      background-clip:text;
+      color:transparent;
     }
-    .brand-title span {
-      color:#60a5fa;
-    }
-    .brand-sub {
+    .eagle-header-sub {
       font-size:11px;
       color:var(--text-muted);
     }
+
     nav {
       display:flex;
       gap:10px;
@@ -484,38 +490,42 @@ LAYOUT_TEMPLATE = """
       font-size:13px;
       padding:7px 14px;
       border-radius:999px;
-      color:var(--text-muted);
+      color:#0f172a;
       text-decoration:none;
-      border:1px solid rgba(148,163,184,0.35);
-      background:rgba(15,23,42,0.95);
+      border:1px solid rgba(209,213,219,0.9);
+      background:#f9fafb;
     }
     .nav-link:hover {
-      color:#f9fafb;
       border-color:var(--accent-primary);
+      box-shadow:0 0 14px rgba(59,130,246,0.5);
     }
     .nav-link.active {
       color:#f9fafb;
       background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
       border-color:transparent;
-      box-shadow:0 12px 30px rgba(37,99,235,0.75);
+      box-shadow:
+        0 0 18px rgba(59,130,246,0.8),
+        0 0 28px rgba(129,140,248,0.9);
     }
     .logout-link {
       font-size:12px;
       padding:7px 11px;
       border-radius:999px;
-      border:1px solid rgba(148,163,184,0.45);
-      background:rgba(15,23,42,0.9);
+      border:1px solid rgba(209,213,219,0.9);
+      background:#ffffff;
       color:var(--text-muted);
       text-decoration:none;
     }
     .logout-link:hover {
       border-color:var(--accent-secondary);
-      color:#f9fafb;
+      color:#111827;
+      box-shadow:0 0 14px rgba(168,85,247,0.4);
     }
 
     h2 {
       margin:0 0 14px;
       font-size:20px;
+      color:#0f172a;
     }
 
     .grid {
@@ -525,22 +535,22 @@ LAYOUT_TEMPLATE = """
       margin-bottom:18px;
     }
     .card {
-      background:
-        radial-gradient(circle at top left, rgba(37,99,235,0.10), transparent 55%),
-        linear-gradient(to bottom right, #020617, #020617);
-      border-radius:16px;
+      background:#ffffff;
+      border-radius:18px;
       padding:16px 18px;
-      border:1px solid rgba(148,163,184,0.32);
-      box-shadow:0 20px 60px rgba(15,23,42,1);
+      border:1px solid rgba(209,213,219,0.9);
+      box-shadow:
+        0 10px 30px rgba(15,23,42,0.25);
     }
     .card h3 {
       margin:0 0 6px;
       font-size:14px;
-      color:#e5e7eb;
+      color:#111827;
     }
     .card .big {
       font-size:28px;
       font-weight:600;
+      color:#111827;
     }
     .muted {
       font-size:12px;
@@ -555,7 +565,7 @@ LAYOUT_TEMPLATE = """
     th, td {
       padding:8px 10px;
       text-align:left;
-      border-bottom:1px solid rgba(31,41,55,0.9);
+      border-bottom:1px solid rgba(229,231,235,0.9);
     }
     th {
       font-size:11px;
@@ -564,7 +574,7 @@ LAYOUT_TEMPLATE = """
       color:var(--text-muted);
     }
     tr:hover td {
-      background:rgba(15,23,42,0.92);
+      background:#f9fafb;
     }
 
     .pill {
@@ -572,8 +582,9 @@ LAYOUT_TEMPLATE = """
       padding:3px 8px;
       border-radius:999px;
       font-size:11px;
-      border:1px solid rgba(148,163,184,0.45);
-      color:var(--text-muted);
+      border:1px solid rgba(209,213,219,0.9);
+      color:#111827;
+      background:#f3f4ff;
     }
 
     .btn {
@@ -587,19 +598,21 @@ LAYOUT_TEMPLATE = """
       font-size:13px;
       color:#f9fafb;
       background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
-      box-shadow:0 12px 30px rgba(37,99,235,0.7);
+      box-shadow:
+        0 10px 25px rgba(59,130,246,0.6),
+        0 0 24px rgba(129,140,248,0.8);
     }
     .btn:hover { filter:brightness(1.05); }
 
     .btn-secondary {
-      background:rgba(15,23,42,0.96);
-      border:1px solid rgba(148,163,184,0.6);
-      color:var(--text-muted);
+      background:#f9fafb;
+      border:1px solid rgba(209,213,219,0.9);
+      color:#111827;
       box-shadow:none;
     }
     .btn-secondary:hover {
       border-color:var(--accent-primary);
-      color:#e5e7eb;
+      box-shadow:0 0 12px rgba(59,130,246,0.4);
     }
 
     .status-badge {
@@ -607,26 +620,27 @@ LAYOUT_TEMPLATE = """
       border-radius:999px;
       font-size:11px;
       font-weight:500;
+      border:1px solid transparent;
     }
     .status-ok {
-      background:rgba(34,197,94,0.16);
-      color:#bbf7d0;
-      border:1px solid rgba(34,197,94,0.7);
+      background:rgba(22,163,74,0.10);
+      color:#166534;
+      border-color:rgba(22,163,74,0.9);
     }
     .status-fail {
-      background:rgba(249,115,22,0.16);
-      color:#fed7aa;
-      border:1px solid rgba(249,115,22,0.7);
+      background:rgba(248,113,113,0.10);
+      color:#b91c1c;
+      border-color:rgba(239,68,68,0.9);
     }
     .status-unknown {
-      background:rgba(148,163,184,0.15);
-      color:#e5e7eb;
-      border:1px solid rgba(148,163,184,0.65);
+      background:rgba(209,213,219,0.4);
+      color:#374151;
+      border-color:rgba(156,163,175,0.9);
     }
     .status-checking {
-      background:rgba(234,179,8,0.18);
-      color:#facc15;
-      border:1px solid rgba(234,179,8,0.85);
+      background:rgba(251,191,36,0.10);
+      color:#92400e;
+      border-color:rgba(217,119,6,0.9);
     }
 
     .form-row {
@@ -642,22 +656,23 @@ LAYOUT_TEMPLATE = """
       margin-bottom:3px;
     }
     .form-row input {
-      border-radius:10px;
-      border:1px solid rgba(51,65,85,0.9);
-      background:#020617;
-      color:#e5e7eb;
-      padding:7px 9px;
+      border-radius:999px;
+      border:1px solid rgba(209,213,219,0.9);
+      background:#f9fafb;
+      color:#111827;
+      padding:7px 12px;
       min-width:140px;
       font-size:13px;
     }
     .form-row input:focus {
       outline:none;
       border-color:var(--accent-primary);
-      box-shadow:0 0 0 1px rgba(37,99,235,0.5);
+      box-shadow:0 0 0 1px rgba(59,130,246,0.4);
+      background:#ffffff;
     }
 
     .error-msg {
-      color:var(--accent-fail);
+      color:#b91c1c;
       font-size:12px;
       margin-top:4px;
     }
@@ -669,7 +684,6 @@ LAYOUT_TEMPLATE = """
       text-align:center;
     }
 
-    /* Progress bar zone */
     .progress-wrapper {
       margin-top:10px;
       font-size:12px;
@@ -679,16 +693,16 @@ LAYOUT_TEMPLATE = """
       width:100%;
       height:7px;
       border-radius:999px;
-      background:rgba(15,23,42,0.9);
+      background:#e5e7eb;
       overflow:hidden;
       margin-top:6px;
-      border:1px solid rgba(31,41,55,0.9);
+      border:1px solid rgba(209,213,219,0.9);
     }
     .progress-bar-inner {
       height:100%;
       width:0%;
       border-radius:999px;
-      background:linear-gradient(90deg,var(--accent-primary),var(--accent-secondary));
+      background:linear-gradient(90deg,#3b82f6,#a855f7);
       transition:width .18s ease-out;
     }
 
@@ -696,48 +710,22 @@ LAYOUT_TEMPLATE = """
       header { flex-direction:column; align-items:flex-start; gap:10px; }
       .shell { padding:14px 14px 24px; }
     }
-  
-    /* --- EAGLE HEADER LOGO --- */
-    .eagle-header {
-      display:flex;
-      align-items:center;
-      gap:10px;
+
+    .pre-proxies {
+      width:100%;
+      min-height:260px;
+      border-radius:16px;
+      border:1px solid rgba(209,213,219,0.9);
+      background:#f9fafb;
+      padding:10px;
+      color:#111827;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size:12px;
+      resize:vertical;
     }
-    .eagle-header-mark {
-      width:32px;
-      height:32px;
-      border-radius:12px;
-      background: radial-gradient(circle at 0% 0%, #22c55e, #0ea5e9 45%, #a855f7 90%);
-      box-shadow:
-        0 0 12px rgba(56,189,248,0.85),
-        0 0 18px rgba(168,85,247,0.7);
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      color:#0b1120;
-      font-weight:800;
-      font-size:16px;
-      letter-spacing:.12em;
-      text-transform:uppercase;
-    }
-    .eagle-header-mark span {
-      transform:translateY(1px);
-    }
-    .eagle-header-text {
-      display:flex;
-      flex-direction:column;
-      gap:2px;
-    }
-    .eagle-header-title {
-      font-size:13px;
-      letter-spacing:.18em;
-      text-transform:uppercase;
-      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
-      -webkit-background-clip:text;
-      background-clip:text;
-      color:transparent;
-    }
-    .eagle-header-sub {
+
+    .clipboard-info {
+      margin-top:6px;
       font-size:11px;
       color:var(--text-muted);
     }
@@ -748,12 +736,10 @@ LAYOUT_TEMPLATE = """
   <div class="shell">
     <header>
       <div class="brand">
-        <div class="eagle-header">
-          <div class="eagle-header-mark"><span>E</span></div>
-          <div class="eagle-header-text">
-            <div class="eagle-header-title">Eagle Proxy Panel</div>
-            <div class="eagle-header-sub">Internal proxy management console</div>
-          </div>
+        <img src="/static/eagle_logo.png" alt="Eagle logo" class="eagle-header-logo">
+        <div class="eagle-header-text">
+          <div class="eagle-header-title">Eagle Proxy Panel</div>
+          <div class="eagle-header-sub">Internal proxy management console</div>
         </div>
       </div>
       <nav>
