@@ -1,1250 +1,604 @@
-#!/usr/bin/env python3
-import os
-import json
-import datetime
-from functools import wraps
-from io import BytesIO
-
-import requests
-from flask import (
-    Flask,
-    request,
-    redirect,
-    url_for,
-    render_template_string,
-    session,
-    send_file,
-    jsonify,
-    abort,
-)
-from werkzeug.security import generate_password_hash, check_password_hash
-
-# -----------------------------
-# Configuration de base
-# -----------------------------
-
-APP_TITLE = "Proxy Panel"
-
-PROXY_SOURCE_FILE = "/root/proxies.txt"
-DB_FILE = "/root/proxy_panel_db.json"
-CONFIG_FILE = "/root/proxy_panel_config.json"
-
-CHECK_TEST_URL = "https://www.google.com"
-CHECK_TIMEOUT = 20  # secondes
-
-app = Flask(__name__)
-app.secret_key = "change-me-if-you-want"  # pour la session Flask
-
-
-# =============================
-# Utilitaires fichiers
-# =============================
-
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def save_json(path, data):
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, path)
-
-
-# =============================
-# Config admin (login / pass)
-# =============================
-
-def ensure_config():
-    cfg = load_json(CONFIG_FILE, {})
-    changed = False
-    if "admin_username" not in cfg:
-        cfg["admin_username"] = "admin"
-        changed = True
-    if "password_hash" not in cfg:
-        cfg["password_hash"] = generate_password_hash("lolopolo")
-        changed = True
-    if changed:
-        save_json(CONFIG_FILE, cfg)
-    return cfg
-
-
-def get_config():
-    return ensure_config()
-
-
-def set_admin_password(new_username, new_password):
-    cfg = get_config()
-    if new_username:
-        cfg["admin_username"] = new_username
-    if new_password:
-        cfg["password_hash"] = generate_password_hash(new_password)
-    save_json(CONFIG_FILE, cfg)
-
-
-# =============================
-# DB clients / proxies
-# =============================
-
-def ensure_db():
-    db = load_json(DB_FILE, {})
-    changed = False
-    if "clients" not in db:
-        db["clients"] = []
-        changed = True
-    if "assigned_proxies" not in db:
-        db["assigned_proxies"] = {}  # proxy_line -> client_id
-        changed = True
-    if changed:
-        save_json(DB_FILE, db)
-    return db
-
-
-def get_db():
-    return ensure_db()
-
-
-def save_db(db):
-    save_json(DB_FILE, db)
-
-
-def next_client_id(db):
-    if not db["clients"]:
-        return 1
-    return max(c["id"] for c in db["clients"]) + 1
-
-
-# =============================
-# Proxies: chargement + stats
-# =============================
-
-def load_proxy_list():
-    if not os.path.exists(PROXY_SOURCE_FILE):
-        return []
-    proxies = []
-    with open(PROXY_SOURCE_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            proxies.append(line)
-    return proxies
-
-
-def compute_stats():
-    db = get_db()
-    all_proxies = load_proxy_list()
-    assigned = set(db["assigned_proxies"].keys())
-    total = len(all_proxies)
-    assigned_count = len(assigned & set(all_proxies))
-    available_count = total - assigned_count
-    clients_count = len(db["clients"])
-    return {
-        "total_proxies": total,
-        "assigned_proxies": assigned_count,
-        "available_proxies": available_count,
-        "clients_count": clients_count,
-        "proxy_source": PROXY_SOURCE_FILE,
-        "db_file": DB_FILE,
-    }
-
-
-# =============================
-# Login / sessions
-# =============================
-
-def login_required(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if not session.get("logged_in"):
-            return redirect(url_for("login", next=request.path))
-        return f(*args, **kwargs)
-    return wrapper
-
-
-# =============================
-# Parsing / check des proxies
-# =============================
-
-def parse_proxy_line(line: str):
-    """
-    Accepte :
-      IP:PORT
-      IP:PORT:USER:PASS
-    Retourne dict ou None si invalide.
-    """
-    line = line.strip()
-    if not line or line.startswith("#"):
-        return None
-    parts = line.split(":")
-    if len(parts) == 2:
-        host, port = parts
-        user = password = None
-    elif len(parts) == 4:
-        host, port, user, password = parts
-    else:
-        return None
-    try:
-        port = int(port)
-    except ValueError:
-        return None
-    return {
-        "host": host,
-        "port": port,
-        "user": user,
-        "password": password,
-    }
-
-
-def build_proxy_url(info: dict) -> str:
-    if info["user"] and info["password"]:
-        return f"http://{info['user']}:{info['password']}@{info['host']}:{info['port']}"
-    else:
-        return f"http://{info['host']}:{info['port']}"
-
-
-def check_proxy(proxy_line: str, timeout: float = CHECK_TIMEOUT) -> bool:
-    """
-    Test via HTTPS sur Google.
-    True = OK, False = FAIL.
-    """
-    info = parse_proxy_line(proxy_line)
-    if not info:
-        return False
-
-    proxy_url = build_proxy_url(info)
-    proxies = {"http": proxy_url, "https": proxy_url}
-
-    try:
-        r = requests.get(CHECK_TEST_URL, proxies=proxies, timeout=timeout)
-        return 200 <= r.status_code < 400
-    except Exception:
-        return False
-
-
-# =============================
-# Templates
-# =============================
-
-# ---- LOGIN : même structure, couleurs néon + photo de proxy ----
-LOGIN_TEMPLATE = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{{ title }} - Login</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    * { box-sizing:border-box; }
-    body {
-      margin: 0;
-      font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      /* Photo de datacenter + overlay sombre néon */
-      background-image:
-        radial-gradient(circle at top left, rgba(0, 245, 255, 0.25), transparent 55%),
-        radial-gradient(circle at bottom right, rgba(255, 45, 251, 0.22), transparent 55%),
-        linear-gradient(160deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
-        url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
-      background-size: cover;
-      background-position: center;
-      background-attachment: fixed;
-      color: #e5e7eb;
-      height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .card {
-      width: 380px;
-      border-radius: 20px;
-      padding: 28px 30px 26px;
-      background:
-        radial-gradient(circle at top left, rgba(0,245,255,0.09), transparent 60%),
-        radial-gradient(circle at bottom right, rgba(255,45,251,0.10), transparent 60%),
-        rgba(15,23,42,0.96);
-      border: 1px solid rgba(59,130,246,0.6);
-      box-shadow:
-        0 0 30px rgba(0,245,255,0.4),
-        0 30px 80px rgba(0,0,0,0.9);
-      backdrop-filter: blur(6px);
-    }
-    .badge {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: .16em;
-      color: #a5b4fc;
-      margin-bottom: 8px;
-    }
-    .logo {
-      font-weight: 700;
-      letter-spacing: .24em;
-      font-size: 12px;
-      text-transform: uppercase;
-      color: #e5e7eb;
-      margin-bottom: 14px;
-    }
-    .logo span {
-      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
-      -webkit-background-clip: text;
-      background-clip: text;
-      color: transparent;
-    }
-    h1 {
-      margin: 0 0 6px;
-      font-size: 22px;
-    }
-    .subtitle {
-      font-size: 13px;
-      color: #9ca3af;
-      margin-bottom: 18px;
-    }
-    label {
-      display: block;
-      font-size: 13px;
-      color: #e5e7eb;
-      margin-bottom: 5px;
-    }
-    input {
-      width: 100%;
-      border-radius: 999px;
-      border: 1px solid rgba(30,64,175,0.9);
-      background: rgba(2,6,23,0.95);
-      color: #e5e7eb;
-      font-size: 14px;
-      padding: 9px 12px;
-      outline: none;
-    }
-    input:focus {
-      border-color: #0ea5e9;
-      box-shadow: 0 0 0 1px rgba(14,165,233,0.6), 0 0 12px rgba(56,189,248,0.7);
-    }
-    .field {
-      margin-bottom: 14px;
-    }
-    .btn {
-      margin-top: 6px;
-      width: 100%;
-      border-radius: 999px;
-      border: none;
-      padding: 10px 0;
-      font-size: 14px;
-      font-weight: 600;
-      letter-spacing: .06em;
-      text-transform: uppercase;
-      cursor: pointer;
-      color: #0b1120;
-      background: linear-gradient(135deg,#22c55e,#0ea5e9,#a855f7);
-      box-shadow:
-        0 0 25px rgba(34,197,94,0.8),
-        0 0 40px rgba(14,165,233,0.7);
-    }
-    .btn:hover { filter: brightness(1.08); }
-    .error {
-      margin-top: 10px;
-      font-size: 13px;
-      color: #fb7185;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="badge">Admin console</div>
-    <div class="logo"><span>{{ title }}</span></div>
-    <h1>Sign in</h1>
-    <div class="subtitle">Secure access to your proxy management dashboard.</div>
-
-    <form method="post">
-      <div class="field">
-        <label>Username</label>
-        <input type="text" name="username" value="{{ default_user }}">
-      </div>
-      <div class="field">
-        <label>Password</label>
-        <input type="password" name="password">
-      </div>
-      <button class="btn" type="submit">Sign in</button>
-    </form>
-
-    {% if error %}
-      <div class="error">{{ error }}</div>
-    {% endif %}
-  </div>
-</body>
-</html>
-"""
-
-# ---- LAYOUT : même structure, néon + même “check proxies” ----
-LAYOUT_TEMPLATE = """
-{% macro nav_link(href, label, active_name) -%}
-  <a href="{{ href }}" class="nav-link {{ 'active' if active == active_name else '' }}">{{ label }}</a>
-{%- endmacro %}
-
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{{ title }} - {{ page_title }}</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    :root {
-      --bg-main: #020617;
-      --text-main: #e5e7eb;
-      --text-muted: #9ca3af;
-      --accent-primary: #0ea5e9;   /* cyan */
-      --accent-secondary: #a855f7; /* violet */
-      --accent-tertiary: #22c55e;  /* vert néon */
-      --accent-ok: #22c55e;
-      --accent-fail: #fb923c;
-      --accent-warn: #eab308;
-    }
-    * { box-sizing:border-box; }
-    body {
-      margin:0;
-      font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      /* même photo de fond que login */
-      background-image:
-        radial-gradient(circle at 0% 0%, rgba(14,165,233,0.20), transparent 60%),
-        radial-gradient(circle at 100% 0%, rgba(168,85,247,0.18), transparent 60%),
-        linear-gradient(180deg, rgba(3,7,18,0.96), rgba(3,7,18,0.98)),
-        url("https://images.pexels.com/photos/4219643/pexels-photo-4219643.jpeg?auto=compress&cs=tinysrgb&w=1600");
-      background-size: cover;
-      background-position: center;
-      background-attachment: fixed;
-      color:var(--text-main);
-      min-height:100vh;
-    }
-    .shell {
-      max-width: 1280px;
-      margin: 0 auto;
-      padding: 18px 20px 30px;
-    }
-    header {
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      margin-bottom:18px;
-    }
-    .brand {
-      display:flex;
-      flex-direction:column;
-      gap:2px;
-    }
-    .brand-title {
-      font-weight:700;
-      letter-spacing:.2em;
-      font-size:12px;
-      text-transform:uppercase;
-    }
-    .brand-title span {
-      background: linear-gradient(135deg,#0ea5e9,#22c55e,#f97316,#ec4899);
-      -webkit-background-clip:text;
-      background-clip:text;
-      color:transparent;
-    }
-    .brand-sub {
-      font-size:11px;
-      color:var(--text-muted);
-    }
-    nav {
-      display:flex;
-      gap:10px;
-      align-items:center;
-    }
-    .nav-link {
-      font-size:13px;
-      padding:7px 14px;
-      border-radius:999px;
-      color:#e5e7eb;
-      text-decoration:none;
-      border:1px solid rgba(148,163,184,0.45);
-      background:rgba(15,23,42,0.86);
-      box-shadow:0 0 0 1px rgba(15,23,42,0.9);
-    }
-    .nav-link:hover {
-      border-color:var(--accent-primary);
-      box-shadow:0 0 14px rgba(14,165,233,0.7);
-    }
-    .nav-link.active {
-      color:#0b1120;
-      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));
-      border-color:transparent;
-      box-shadow:
-        0 0 18px rgba(14,165,233,0.9),
-        0 0 28px rgba(168,85,247,0.7);
-    }
-    .logout-link {
-      font-size:12px;
-      padding:7px 11px;
-      border-radius:999px;
-      border:1px solid rgba(148,163,184,0.45);
-      background:rgba(15,23,42,0.9);
-      color:var(--text-muted);
-      text-decoration:none;
-    }
-    .logout-link:hover {
-      border-color:var(--accent-secondary);
-      color:#f9fafb;
-      box-shadow:0 0 14px rgba(168,85,247,0.7);
-    }
-
-    h2 {
-      margin:0 0 14px;
-      font-size:20px;
-    }
-
-    .grid {
-      display:grid;
-      grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
-      gap:14px;
-      margin-bottom:18px;
-    }
-    .card {
-      background:
-        radial-gradient(circle at top left, rgba(14,165,233,0.20), transparent 55%),
-        radial-gradient(circle at bottom right, rgba(168,85,247,0.18), transparent 55%),
-        rgba(15,23,42,0.92);
-      border-radius:18px;
-      padding:16px 18px;
-      border:1px solid rgba(59,130,246,0.6);
-      box-shadow:
-        0 0 26px rgba(14,165,233,0.45),
-        0 24px 70px rgba(0,0,0,0.9);
-      backdrop-filter: blur(4px);
-    }
-    .card h3 {
-      margin:0 0 6px;
-      font-size:14px;
-      color:#e5e7eb;
-    }
-    .card .big {
-      font-size:28px;
-      font-weight:600;
-    }
-    .muted {
-      font-size:12px;
-      color:var(--text-muted);
-    }
-
-    table {
-      width:100%;
-      border-collapse:collapse;
-      font-size:13px;
-    }
-    th, td {
-      padding:8px 10px;
-      text-align:left;
-      border-bottom:1px solid rgba(31,41,55,0.9);
-    }
-    th {
-      font-size:11px;
-      text-transform:uppercase;
-      letter-spacing:.08em;
-      color:var(--text-muted);
-    }
-    tr:hover td {
-      background:rgba(15,23,42,0.9);
-    }
-
-    .pill {
-      display:inline-block;
-      padding:3px 8px;
-      border-radius:999px;
-      font-size:11px;
-      border:1px solid rgba(148,163,184,0.6);
-      color:#e5e7eb;
-      background:rgba(15,23,42,0.96);
-    }
-
-    .btn {
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      padding:7px 15px;
-      border-radius:999px;
-      border:none;
-      cursor:pointer;
-      font-size:13px;
-      color:#020617;
-      background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary),var(--accent-tertiary));
-      box-shadow:
-        0 0 22px rgba(14,165,233,0.9),
-        0 0 32px rgba(168,85,247,0.7);
-    }
-    .btn:hover { filter:brightness(1.06); }
-
-    .btn-secondary {
-      background:rgba(15,23,42,0.96);
-      border:1px solid rgba(148,163,184,0.7);
-      color:var(--text-main);
-      box-shadow:none;
-    }
-    .btn-secondary:hover {
-      border-color:var(--accent-primary);
-      box-shadow:0 0 16px rgba(14,165,233,0.7);
-    }
-
-    .status-badge {
-      padding:3px 9px;
-      border-radius:999px;
-      font-size:11px;
-      font-weight:500;
-      border:1px solid transparent;
-    }
-    .status-ok {
-      background:rgba(34,197,94,0.16);
-      color:#bbf7d0;
-      border-color:rgba(34,197,94,0.8);
-      box-shadow:0 0 10px rgba(34,197,94,0.7);
-    }
-    .status-fail {
-      background:rgba(248,113,113,0.16);
-      color:#fed7aa;
-      border-color:rgba(248,113,113,0.9);
-      box-shadow:0 0 10px rgba(248,113,113,0.7);
-    }
-    .status-unknown {
-      background:rgba(148,163,184,0.18);
-      color:#e5e7eb;
-      border-color:rgba(148,163,184,0.9);
-    }
-    .status-checking {
-      background:rgba(234,179,8,0.18);
-      color:#facc15;
-      border-color:rgba(234,179,8,0.9);
-      box-shadow:0 0 10px rgba(250,204,21,0.7);
-    }
-
-    .form-row {
-      display:flex;
-      flex-wrap:wrap;
-      gap:12px;
-      margin-bottom:12px;
-    }
-    .form-row label {
-      font-size:12px;
-      color:var(--text-muted);
-      display:block;
-      margin-bottom:3px;
-    }
-    .form-row input {
-      border-radius:999px;
-      border:1px solid rgba(51,65,85,0.9);
-      background:rgba(2,6,23,0.96);
-      color:#e5e7eb;
-      padding:7px 12px;
-      min-width:140px;
-      font-size:13px;
-    }
-    .form-row input:focus {
-      outline:none;
-      border-color:var(--accent-primary);
-      box-shadow:0 0 0 1px rgba(14,165,233,0.6);
-    }
-
-    .error-msg {
-      color:#fb7185;
-      font-size:12px;
-      margin-top:4px;
-    }
-
-    .footer-note {
-      margin-top:18px;
-      font-size:11px;
-      color:var(--text-muted);
-      text-align:center;
-      text-shadow:0 0 10px rgba(15,23,42,0.9);
-    }
-
-    .progress-wrapper {
-      margin-top:10px;
-      font-size:12px;
-      color:var(--text-muted);
-    }
-    .progress-bar-outer {
-      width:100%;
-      height:7px;
-      border-radius:999px;
-      background:rgba(15,23,42,0.96);
-      overflow:hidden;
-      margin-top:6px;
-      border:1px solid rgba(31,41,55,0.9);
-      box-shadow:0 0 14px rgba(14,165,233,0.6);
-    }
-    .progress-bar-inner {
-      height:100%;
-      width:0%;
-      border-radius:999px;
-      background:linear-gradient(90deg,#22c55e,#0ea5e9,#a855f7,#ec4899);
-      transition:width .18s ease-out;
-    }
-
-    @media (max-width: 680px) {
-      header { flex-direction:column; align-items:flex-start; gap:10px; }
-      .shell { padding:14px 14px 24px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <header>
-      <div class="brand">
-        <div class="brand-title"><span>{{ title }}</span></div>
-        <div class="brand-sub">Internal proxy management console</div>
-      </div>
-      <nav>
-        {{ nav_link(url_for('dashboard'), 'Dashboard', 'dashboard') }}
-        {{ nav_link(url_for('clients'), 'Clients', 'clients') }}
-        {{ nav_link(url_for('proxies'), 'Proxies', 'proxies') }}
-        {{ nav_link(url_for('settings'), 'Settings', 'settings') }}
-        <a class="logout-link" href="{{ url_for('logout') }}">Logout</a>
-      </nav>
-    </header>
-
-    {{ body|safe }}
-
-    <div class="footer-note">
-      Local-only admin panel · Proxy source: {{ stats.proxy_source }} · DB: {{ stats.db_file }}
-    </div>
-  </div>
-</body>
-</html>
-"""
-
-
-# =============================
-# Routes
-# =============================
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    cfg = get_config()
-    error = None
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        if username == cfg["admin_username"] and check_password_hash(cfg["password_hash"], password):
-            session["logged_in"] = True
-            next_url = request.args.get("next") or url_for("dashboard")
-            return redirect(next_url)
-        else:
-            error = "Invalid username or password."
-    return render_template_string(
-        LOGIN_TEMPLATE,
-        title=APP_TITLE,
-        error=error,
-        default_user=cfg["admin_username"],
+#!/bin/bash
+
+set -e
+
+############################################
+# 0. Licence check with progress bar
+############################################
+
+BAR_WIDTH=30
+BAR_CHAR="#"
+
+GREEN="\e[32m"
+RED="\e[31m"
+RESET="\e[0m"
+YELLOW='\e[33m'
+ORANGE='\e[38;5;208m'
+PINK='\e[35m'
+BLUE='\e[34m'
+
+TMP_OUT=$(mktemp)
+
+/usr/local/bin/check_license.sh --no-reboot >"$TMP_OUT" 2>&1 &
+LIC_PID=$!
+progress=0
+
+printf "Checking licence... ${GREEN}[%*s]${RESET}" "$BAR_WIDTH" ""
+
+while kill -0 "$LIC_PID" 2>/dev/null; do
+    if [ "$progress" -lt "$BAR_WIDTH" ]; then
+        progress=$((progress + 1))
+    fi
+
+    filled=$(printf "%*s" "$progress" "" | tr ' ' "$BAR_CHAR")
+    empty=$(printf "%*s" "$((BAR_WIDTH - progress))" "")
+
+    printf "\rChecking licence... ${GREEN}[%s%s]${RESET}" "$filled" "$empty"
+    sleep 0.1
+done
+
+if wait "$LIC_PID"; then
+    LIC_RC=0
+else
+    LIC_RC=$?
+fi
+
+filled=$(printf "%*s" "$BAR_WIDTH" "" | tr ' ' "$BAR_CHAR")
+printf "\rChecking licence... ${GREEN}[%s]${RESET}\n" "$filled"
+
+if [ "$LIC_RC" -ne 0 ]; then
+    echo
+    cat "$TMP_OUT"
+    rm -f "$TMP_OUT"
+    exit "$LIC_RC"
+fi
+
+rm -f "$TMP_OUT"
+echo
+
+############################################
+# Helper: generic progress bar (white)
+############################################
+progress_bar() {
+    local current="$1"
+    local total="$2"
+    local label="$3"
+    local width=40
+
+    if [ "$total" -le 0 ]; then
+        total=1
+    fi
+
+    local percent=$(( current * 100 / total ))
+    [ "$percent" -gt 100 ] && percent=100
+    local filled=$(( current * width / total ))
+    local empty=$(( width - filled ))
+
+    local bar_filled
+    local bar_empty
+    bar_filled=$(printf "%*s" "$filled" "" | tr ' ' '#')
+    bar_empty=$(printf "%*s" "$empty" "" | tr ' ' ' ')
+
+    # blanc (ou couleur par défaut du terminal)
+    printf "\r%s [%-*s] %3d%%" "$label" "$width" "${bar_filled}${bar_empty}" "$percent"
+}
+
+############################################
+# 1. Ask how many proxies to generate
+############################################
+
+DEFAULT_COUNT=3000
+echo
+read -r -p "How many proxies do you want to generate? [default: ${DEFAULT_COUNT}]: " USER_COUNT
+
+if [ -z "$USER_COUNT" ]; then
+    COUNT="$DEFAULT_COUNT"
+elif [[ "$USER_COUNT" =~ ^[0-9]+$ ]] && [ "$USER_COUNT" -gt 0 ]; then
+    COUNT="$USER_COUNT"
+else
+    echo "Invalid number, using default ${DEFAULT_COUNT}."
+    COUNT="$DEFAULT_COUNT"
+fi
+
+echo
+echo "Using COUNT=${COUNT} proxies."
+echo
+
+############################################
+# 2. Global configuration
+############################################
+
+# Physical WAN interface
+WAN_IF="ens160"
+
+# 3proxy instances (multi-port)
+BASE_PORT1=30000          # Instance 1 base port
+BASE_PORT2=60000          # Instance 2 base port
+MAX_PER_INSTANCE=1000     # Max proxies on instance 1 (and 2)
+
+PARALLEL_START=50         # Number of PPP sessions to start before short pause
+
+# Routing table base ID
+TABLE_BASE=9000
+
+# PPP credentials
+PPP_USER="centre04"
+PPP_PASS="centre04"
+
+# Files and binaries
+PROXY_LIST_RAW="/root/proxies_raw.txt"   # internal raw list (for generation & tests)
+PROXY_LIST_FILE="/root/proxies.txt"      # final public list (served on port 1991)
+
+THREEPROXY_BIN="/usr/local/bin/3proxy"
+THREEPROXY_CFG1="/usr/local/etc/3proxy/3proxy1.cfg"
+THREEPROXY_CFG2="/usr/local/etc/3proxy/3proxy2.cfg"
+
+# Map proxy TCP port -> PPP index (pppX)  **CORRIGÉ**
+get_ppp_index_from_port() {
+    local port="$1"
+
+    # First 3proxy instance ports: BASE_PORT1 .. BASE_PORT1+MAX_PER_INSTANCE-1
+    if (( port >= BASE_PORT1 && port < BASE_PORT1 + MAX_PER_INSTANCE )); then
+        # ppp0 .. ppp(MAX_PER_INSTANCE-1)
+        echo $(( port - BASE_PORT1 ))
+        return 0
+    fi
+
+    # Second 3proxy instance ports: BASE_PORT2 .. BASE_PORT2+MAX_PER_INSTANCE-1
+    if (( port >= BASE_PORT2 && port < BASE_PORT2 + MAX_PER_INSTANCE )); then
+        # pppMAX_PER_INSTANCE .. ppp(2*MAX_PER_INSTANCE-1)
+        echo $(( port - BASE_PORT2 + MAX_PER_INSTANCE ))
+        return 0
+    fi
+
+    # Unknown / out of range
+    echo "-1"
+    return 1
+}
+
+############################################
+# 3. Detect local IP on WAN_IF
+############################################
+
+LISTEN_IP=$(ip -4 addr show dev "$WAN_IF" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+
+if [ -z "$LISTEN_IP" ]; then
+    echo "Unable to automatically detect IP address on ${WAN_IF}"
+    exit 1
+fi
+
+echo "$(date) - Local IP on ${WAN_IF}: ${LISTEN_IP}"
+echo
+
+if [ ! -x "$THREEPROXY_BIN" ]; then
+    echo "3proxy binary not found at: $THREEPROXY_BIN"
+    exit 1
+fi
+
+if ! ip link show "$WAN_IF" >/dev/null 2>&1; then
+    echo "Interface ${WAN_IF} not found."
+    exit 1
+fi
+
+############################################
+# 4. Cleanup old configs + macvlans
+############################################
+
+echo "$(date) - Cleaning old configuration..."
+
+pkill 3proxy  >/dev/null 2>&1 || true
+pkill pppd    >/dev/null 2>&1 || true
+
+# Clean old macvlan interfaces (up to COUNT + 500, just to be safe)
+MAX_CLEAN=$((COUNT + 500))
+
+for i in $(seq 0 "$MAX_CLEAN"); do
+    ip link show "macvlan$i" >/dev/null 2>&1 && ip link delete "macvlan$i" || true
+done
+
+# Reset RAW proxy list file (do not write anything yet)
+: > "$PROXY_LIST_RAW"
+
+############################################
+# 5. Ensure PPP secrets contain our user
+############################################
+
+for f in /etc/ppp/chap-secrets /etc/ppp/pap-secrets; do
+    if [ -f "$f" ]; then
+        if ! grep -q "[[:space:]]${PPP_USER}[[:space:]]" "$f" 2>/dev/null; then
+            echo "${PPP_USER} * ${PPP_PASS} *" >>"$f"
+        fi
+    fi
+done
+
+mkdir -p /etc/ppp/peers
+mkdir -p "$(dirname "$THREEPROXY_CFG1")"
+mkdir -p /var/log/3proxy
+
+############################################
+# 6. Prepare 3proxy configs (two instances)
+############################################
+
+cat >"$THREEPROXY_CFG1" <<'EOF1'
+daemon
+maxconn 15000
+nserver 81.192.17.62
+nserver 8.8.8.8
+nscache 65536
+log /var/log/3proxy/log1.log D
+logformat "L%Y-%m-%d %H:%M:%S %E %U %C:%c %R:%r %O %I %h %T"
+timeouts 1 5 30 60 180 1000 15 60
+auth none
+allow *
+EOF1
+
+cat >"$THREEPROXY_CFG2" <<'EOF2'
+daemon
+maxconn 15000
+nserver 81.192.17.62
+nserver 8.8.8.8
+nscache 65536
+log /var/log/3proxy/log2.log D
+logformat "L%Y-%m-%d %H:%M:%S %E %U %C:%c %R:%r %O %I %h %T"
+timeouts 1 5 30 60 180 1000 15 60
+auth none
+allow *
+EOF2
+
+############################################
+# 7. Phase 1 - Create PPPoE sessions in parallel
+############################################
+
+echo "Starting service..."
+echo
+echo "Phase 1: creating PPPoE sessions..."
+echo
+
+PH1_DONE=0
+
+for i in $(seq 0 $((COUNT - 1))); do
+    MACVLAN_IF="macvlan$i"
+
+    if ! ip link add link "$WAN_IF" name "$MACVLAN_IF" type macvlan mode bridge 2>/dev/null; then
+        echo
+        echo "!!! Failed to create ${MACVLAN_IF}"
+        continue
+    fi
+
+    ip link set "$MACVLAN_IF" up
+
+    PEER_FILE="/etc/ppp/peers/pppoe$i"
+
+    cat >"$PEER_FILE" <<EOF
+plugin rp-pppoe.so
+$MACVLAN_IF
+noauth
+defaultroute
+usepeerdns
+mtu 1492
+mru 1492
+
+idle 0
+demand
+
+# Keep the PPP session alive and reconnect automatically
+lcp-echo-interval 30
+lcp-echo-failure 10
+persist
+maxfail 0
+holdoff 5
+ipcp-accept-local
+ipcp-accept-remote
+noccp
+user "$PPP_USER"
+password "$PPP_PASS"
+unit $i
+EOF
+
+    # start pppd in BACKGROUND (we don't wait here)
+    pppd call "pppoe$i" >/var/log/pppoe_$i.log 2>&1 &
+
+    # small pause every PARALLEL_START sessions to avoid overloading everything at once
+    if (((i + 1) % PARALLEL_START == 0)); then
+        sleep 1
+    fi
+
+    # petite pause entre chaque PPP pour soulager le FAI
+    sleep 0.1
+
+    PH1_DONE=$((PH1_DONE + 1))
+    progress_bar "$PH1_DONE" "$COUNT" "Phase 1"
+done
+
+echo    # fin de la barre
+echo
+
+############################################
+# 8. Phase 2 - Wait for PPP + routes + 3proxy entries
+############################################
+
+echo "Phase 2: configuring routes and proxies..."
+echo
+
+PH2_DONE=0
+
+for i in $(seq 0 $((COUNT - 1))); do
+    PPP_IF="ppp$i"
+    MACVLAN_IF="macvlan$i"
+
+    # Wait for pppX interface to appear
+    TIMEOUT=60
+    while ! ip addr show "$PPP_IF" >/dev/null 2>&1 && [ "$TIMEOUT" -gt 0 ]; do
+        sleep 1
+        TIMEOUT=$((TIMEOUT - 1))
+    done
+
+    if ! ip addr show "$PPP_IF" >/dev/null 2>&1; then
+        echo
+        echo "!!! PPPoE failed on ${MACVLAN_IF} (${PPP_IF} not created)"
+        continue
+    fi
+
+    # Get public IP on PPP interface
+    IP_PPP=""
+    TIMEOUT_IP=30
+    while [ -z "$IP_PPP" ] && [ "$TIMEOUT_IP" -gt 0 ]; do
+        IP_PPP=$(ip -4 addr show dev "$PPP_IF" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+        [ -n "$IP_PPP" ] && break
+        sleep 1
+        TIMEOUT_IP=$((TIMEOUT_IP - 1))
+    done
+
+    if [ -z "$IP_PPP" ]; then
+        echo
+        echo "!!! Unable to get IP on ${PPP_IF} (timeout)"
+        continue
+    fi
+
+    ########################################
+    # Quick connectivity test with ping
+    ########################################
+    if command -v ping >/dev/null 2>&1; then
+        if ! ping -I "$PPP_IF" -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then
+            echo
+            echo "!!! Warning: connectivity test FAILED on ${PPP_IF} (${IP_PPP})"
+            echo "    -> Keeping this session anyway (it will be tested as proxy later)."
+        fi
+    fi
+
+    ########################################
+    # Dedicated routing table for this PPP
+    ########################################
+
+    TABLE_ID=$((TABLE_BASE + i))
+
+    # 1) Remove all existing rules for this IP (in any table)
+    while ip rule show | grep -q "from $IP_PPP"; do
+        ip rule delete from "$IP_PPP" >/dev/null 2>&1 || break
+    done
+
+    # 2) Flush routing table for this PPP
+    ip route flush table "$TABLE_ID" >/dev/null 2>&1 || true
+
+    # 3) Add host route for the PPP IP in its table
+    if ! ip route add "$IP_PPP"/32 dev "$PPP_IF" table "$TABLE_ID" >/dev/null 2>&1; then
+        echo
+        echo "!!! Failed to add host route ${IP_PPP}/32 via ${PPP_IF} (interface probably went down)"
+        continue
+    fi
+
+    # 4) Add default route via this PPP interface
+    if ! ip route add default dev "$PPP_IF" table "$TABLE_ID" >/dev/null 2>&1; then
+        echo
+        echo "!!! Failed to add default route via ${PPP_IF}"
+        continue
+    fi
+
+    # 5) Add a single routing rule for this IP to this table
+    if ! ip rule add from "$IP_PPP" table "$TABLE_ID" priority $((9000 + i)) >/dev/null 2>&1; then
+        echo
+        echo "!!! Failed to add ip rule from ${IP_PPP} for table ${TABLE_ID}"
+        continue
+    fi
+
+    ########################################
+    # 3proxy mapping for this PPP (multi-port)
+    ########################################
+
+    if [ "$i" -lt "$MAX_PER_INSTANCE" ]; then
+        # Instance 1
+        PORT=$((BASE_PORT1 + i))
+        echo "proxy -a -p${PORT} -i0.0.0.0 -e${IP_PPP}" >>"$THREEPROXY_CFG1"
+    else
+        # Instance 2
+        INDEX2=$((i - MAX_PER_INSTANCE))
+        PORT=$((BASE_PORT2 + INDEX2))
+        echo "proxy -a -p${PORT} -i0.0.0.0 -e${IP_PPP}" >>"$THREEPROXY_CFG2"
+    fi
+
+    # Open the port in firewall if iptables is available
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || \
+        iptables -A INPUT -p tcp --dport "$PORT" -j ACCEPT
+    fi
+
+    # Add to RAW proxy list file (login/pass fixed example)
+    echo "${IP_PPP}:${PORT}:fibre123:fibrebe123" >>"$PROXY_LIST_RAW"
+
+    PH2_DONE=$((PH2_DONE + 1))
+    progress_bar "$PH2_DONE" "$COUNT" "Phase 2"
+done
+
+echo    # fin de la barre
+echo
+
+############################################
+# 9. Optional: adjust default route via ppp0
+############################################
+
+if ip link show ppp0 >/dev/null 2>&1; then
+    ip route del default dev "$WAN_IF" >/dev/null 2>&1 || true
+    ip route add default dev ppp0       >/dev/null 2>&1 || true
+fi
+
+############################################
+# 10. Mini HTTP server to download proxies.txt
+############################################
+
+IP_PUBLIC="$LISTEN_IP"
+
+if command -v python3 >/dev/null 2>&1; then
+    echo "Server Ready For ${PROXY_LIST_FILE} (ALL interfaces):"
+    (
+        cd "$(dirname "$PROXY_LIST_FILE")" || exit 1
+        python3 -m http.server 1991 --bind 0.0.0.0 >/dev/null 2>&1 &
     )
+    echo " -> http://${IP_PUBLIC}:1991/$(basename "$PROXY_LIST_FILE")"
+else
+    echo "python3 not found, HTTP server not started."
+fi
 
+############################################
+# 11. Start 3proxy instances
+############################################
 
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
+echo
+echo "Starting 3proxy with generated configurations..."
 
+if [ -s "$THREEPROXY_CFG1" ]; then
+    "$THREEPROXY_BIN" "$THREEPROXY_CFG1" &
+    echo " -> 3proxy instance 1 started (ports from ${BASE_PORT1})"
+fi
 
-@app.route("/")
-@login_required
-def root():
-    return redirect(url_for("dashboard"))
+if [ -s "$THREEPROXY_CFG2" ]; then
+    "$THREEPROXY_BIN" "$THREEPROXY_CFG2" &
+    echo " -> 3proxy instance 2 started (ports from ${BASE_PORT2})"
+fi
 
+echo
+echo "Done."
 
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    stats = compute_stats()
-    body = render_template_string("""
-      <h2>Overview</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Proxies</h3>
-          <div class="big">{{ stats.total_proxies }}</div>
-          <div class="muted">Total proxies in pool</div>
-          <div class="muted" style="margin-top:6px;">
-            <span style="color:#bbf7d0;">Available: {{ stats.available_proxies }}</span>
-            &nbsp;·&nbsp;
-            <span style="color:#fed7aa;">Assigned: {{ stats.assigned_proxies }}</span>
-          </div>
-        </div>
-        <div class="card">
-          <h3>Clients</h3>
-          <div class="big">{{ stats.clients_count }}</div>
-          <div class="muted">Each client download has its own text file.</div>
-        </div>
-        <div class="card">
-          <h3>Pool status</h3>
-          <div class="muted">Master proxy file:<br><code>{{ stats.proxy_source }}</code></div>
-          <div class="muted" style="margin-top:6px;">Database file:<br><code>{{ stats.db_file }}</code></div>
-        </div>
-      </div>
-    """, stats=stats)
-    return render_template_string(
-        LAYOUT_TEMPLATE,
-        title=APP_TITLE,
-        page_title="Dashboard",
-        body=body,
-        active="dashboard",
-        stats=stats,
-    )
+############################################
+# 12. Initial proxy verification before export
+#     (keep only proxies that return same IP as HOST)
+############################################
 
+echo -e "Running initial proxy verification (keeping only ${GREEN}STATUS OK${RESET} proxies)..."
 
-@app.route("/clients", methods=["GET", "POST"])
-@login_required
-def clients():
-    stats = compute_stats()
-    db = get_db()
-    error = None
+TMP_FILE=$(mktemp)
+EXPORT_OK=0
+EXPORT_FAIL=0
 
-    if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        count_str = request.form.get("count", "").strip()
-        try:
-            count = int(count_str)
-        except ValueError:
-            count = 0
+# Read the RAW proxy list and keep only proxies that are really OK
+while IFS=':' read -r HOST PORT USER PASS; do
+    # Skip empty lines
+    [ -z "$HOST" ] && continue
 
-        if not name:
-            error = "Client name is required."
-        elif count <= 0:
-            error = "Number of proxies must be a positive integer."
-        else:
-            all_proxies = load_proxy_list()
-            assigned = set(db["assigned_proxies"].keys())
-            available = [p for p in all_proxies if p not in assigned]
+    if [ -n "$USER" ] && [ -n "$PASS" ]; then
+        PROXY_URL="http://${USER}:${PASS}@${HOST}:${PORT}"
+    else
+        PROXY_URL="http://${HOST}:${PORT}"
+    fi
 
-            if len(available) < count:
-                error = f"Not enough available proxies. Requested {count}, only {len(available)} left."
-            else:
-                selected = available[:count]
-                client_id = next_client_id(db)
-                created_at = datetime.datetime.now().isoformat(timespec="seconds")
-                client = {
-                    "id": client_id,
-                    "name": name,
-                    "count": count,
-                    "proxies": selected,
-                    "created_at": created_at,
-                }
-                db["clients"].append(client)
-                for p in selected:
-                    db["assigned_proxies"][p] = client_id
-                save_db(db)
+    # Test through ipv4.icanhazip.com (returned IP must match HOST)
+    PUBLIC_IP=$(curl -sS --max-time 10 -x "$PROXY_URL" https://ipv4.icanhazip.com 2>/dev/null | tr -d '\r\n' || true)
 
-                filename = f"{name}_{count}proxies.txt"
-                content = "\n".join(selected) + "\n"
-                mem = BytesIO(content.encode("utf-8"))
-                mem.seek(0)
-                return send_file(
-                    mem,
-                    as_attachment=True,
-                    download_name=filename,
-                    mimetype="text/plain",
-                )
+    if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" = "$HOST" ]; then
+        # Proxy is good -> keep it in the FINAL file
+        if [ -n "$USER" ] && [ -n "$PASS" ]; then
+            echo "${HOST}:${PORT}:${USER}:${PASS}" >>"$TMP_FILE"
+        else
+            echo "${HOST}:${PORT}" >>"$TMP_FILE"
+        fi
+        EXPORT_OK=$((EXPORT_OK+1))
+        echo -e "${HOST}:${PORT} -> ${PUBLIC_IP} ${GREEN}STATUS OK (KEPT)${RESET}"
+    else
+        # Proxy failed or IP mismatch -> do NOT write it to the FINAL file
+        EXPORT_FAIL=$((EXPORT_FAIL+1))
+        if [ -z "$PUBLIC_IP" ]; then
+            echo -e "${HOST}:${PORT} -> ${RED}STATUS FAIL (no response, REMOVED)${RESET}"
+        else
+            echo -e "${HOST}:${PORT} -> ${PUBLIC_IP} ${RED}STATUS MISMATCH (REMOVED)${RESET}"
+        fi
+    fi
+done < "$PROXY_LIST_RAW"
 
-    db = get_db()
-    clients_list = sorted(db["clients"], key=lambda c: c["id"])
+# Replace/create the FINAL public file
+mv "$TMP_FILE" "$PROXY_LIST_FILE"
 
-    body = render_template_string("""
-      <h2>Clients</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Create new client</h3>
-          <form method="post">
-            <div class="form-row">
-              <div>
-                <label>Client name</label>
-                <input type="text" name="name" placeholder="e.g. Mohamed">
-              </div>
-              <div>
-                <label>Number of proxies</label>
-                <input type="number" name="count" min="1" placeholder="10">
-              </div>
-            </div>
-            {% if error %}
-              <div class="error-msg">{{ error }}</div>
-            {% endif %}
-            <button class="btn" type="submit">Create & download .txt</button>
-            <div class="muted" style="margin-top:8px;">
-              Available proxies: <strong>{{ stats.available_proxies }}</strong>
-            </div>
-          </form>
-        </div>
+echo "Initial export filter summary:"
+echo -e "  ${GREEN}OK proxies kept${RESET} : ${EXPORT_OK}"
+echo -e "  ${RED}Removed (bad)${RESET}    : ${EXPORT_FAIL}"
 
-        <div class="card">
-          <h3>Summary</h3>
-          <div class="muted">
-            Total clients: <strong>{{ stats.clients_count }}</strong><br>
-            Total proxies: <strong>{{ stats.total_proxies }}</strong><br>
-            Assigned: <span style="color:#fed7aa;">{{ stats.assigned_proxies }}</span><br>
-            Available: <span style="color:#bbf7d0;">{{ stats.available_proxies }}</span>
-          </div>
-        </div>
-      </div>
+echo "Proxy list available in: ${PROXY_LIST_FILE}"
 
-      <div class="card" style="margin-top:16px;">
-        <h3>Existing clients</h3>
-        {% if not clients %}
-          <div class="muted">No clients yet.</div>
-        {% else %}
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Name</th>
-                <th>Proxies</th>
-                <th>Created</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for c in clients %}
-                <tr>
-                  <td>#{{ c.id }}</td>
-                  <td>{{ c.name }}</td>
-                  <td>{{ c.count }}</td>
-                  <td>{{ c.created_at }}</td>
-                  <td>
-                    <a class="btn-secondary" href="{{ url_for('download_client', client_id=c.id) }}">Download</a>
-                    <form method="post" action="{{ url_for('delete_client', client_id=c.id) }}" style="display:inline;" onsubmit="return confirm('Delete this client and free its proxies?');">
-                      <button class="btn-secondary" type="submit" style="margin-left:6px;">Delete</button>
-                    </form>
-                  </td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        {% endif %}
-      </div>
-    """, stats=stats, clients=clients_list, error=error)
-    return render_template_string(
-        LAYOUT_TEMPLATE,
-        title=APP_TITLE,
-        page_title="Clients",
-        body=body,
-        active="clients",
-        stats=stats,
-    )
+echo
+echo "Starting live proxy health check (Ctrl+C to stop)..."
 
+############################################
+# 13. Live proxy health check loop
+############################################
 
-@app.route("/clients/<int:client_id>/download")
-@login_required
-def download_client(client_id):
-    db = get_db()
-    client = next((c for c in db["clients"] if c["id"] == client_id), None)
-    if not client:
-        abort(404)
-    filename = f"{client['name']}_{client['count']}proxies.txt"
-    content = "\n".join(client["proxies"]) + "\n"
-    mem = BytesIO(content.encode("utf-8"))
-    mem.seek(0)
-    return send_file(
-        mem,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="text/plain",
-    )
+while true; do
+    echo
+    echo "============================================"
+    echo -e " ${PINK}Proxy health check at $(date)${RESET}"
+    echo -e " File: ${PINK}${PROXY_LIST_FILE}${RESET}"
+    echo "============================================"
 
+    if [ ! -f "$PROXY_LIST_FILE" ]; then
+        echo "Proxy list file ${PROXY_LIST_FILE} not found, exiting health check."
+        break
+    fi
 
-@app.route("/clients/<int:client_id>/delete", methods=["POST"])
-@login_required
-def delete_client(client_id):
-    db = get_db()
-    new_clients = []
-    removed_proxies = []
-    for c in db["clients"]:
-        if c["id"] == client_id:
-            removed_proxies.extend(c.get("proxies", []))
-        else:
-            new_clients.append(c)
-    db["clients"] = new_clients
-    for p in removed_proxies:
-        db["assigned_proxies"].pop(p, None)
-    save_db(db)
-    return redirect(url_for("clients"))
+    # Counters for this round
+    OK_COUNT=0
+    FAIL_COUNT=0
+    # List of FAILED proxies for this round
+    FAILED_LIST=""
 
+    # Read each proxy from the list: HOST:PORT:USER:PASS
+    while IFS=':' read -r HOST PORT USER PASS; do
+        # Skip empty lines
+        [ -z "$HOST" ] && continue
 
-@app.route("/proxies")
-@login_required
-def proxies():
-    stats = compute_stats()
-    all_proxies = load_proxy_list()
-    db = get_db()
-    assigned_map = db["assigned_proxies"]
+        if [ -n "$USER" ] && [ -n "$PASS" ]; then
+            PROXY_URL="http://${USER}:${PASS}@${HOST}:${PORT}"
+        else
+            PROXY_URL="http://${HOST}:${PORT}"
+        fi
 
-    table_data = []
-    for p in all_proxies:
-        client_id = assigned_map.get(p)
-        table_data.append({
-            "proxy": p,
-            "client_id": client_id,
-        })
+        # Test the proxy like an external client: HTTPS request to Google
+        #  - If the request succeeds within 20 seconds => proxy OK
+        #  - If it times out or fails => proxy FAILED
+        if curl -sS --max-time 20 -x "$PROXY_URL" https://www.google.com >/dev/null 2>&1; then
+            echo -e "${HOST}:${PORT} -> ${GREEN}STATUS OK !${RESET}"
+            OK_COUNT=$((OK_COUNT+1))
+        else
+            echo -e "${HOST}:${PORT} -> ${RED}STATUS FAIL${RESET}"
+            FAIL_COUNT=$((FAIL_COUNT+1))
+            # Keep list of failed proxies for the summary
+            FAILED_LIST+="${HOST}:${PORT}\n"
+        fi
 
-    body = render_template_string("""
-      <h2>Proxies</h2>
-      <div class="card" style="margin-bottom:16px;">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-          <div class="muted">
-            Total: <strong>{{ stats.total_proxies }}</strong> ·
-            Available: <span style="color:#bbf7d0;">{{ stats.available_proxies }}</span> ·
-            Assigned: <span style="color:#fed7aa;">{{ stats.assigned_proxies }}</span>
-          </div>
-          <button class="btn" id="check-all-btn">Check ALL Proxies</button>
-        </div>
-        <div class="muted" style="margin-top:4px;font-size:11px;">
-          Performs an HTTPS request to Google using each proxy (timeout {{ timeout }}s).
-        </div>
+    done < "$PROXY_LIST_FILE"
 
-        <div id="progress-wrapper" class="progress-wrapper" style="display:none;">
-          <div>
-            <span id="progress-label">0%</span>
-            &nbsp;·&nbsp;
-            <span id="progress-detail">Waiting…</span>
-          </div>
-          <div class="progress-bar-outer">
-            <div class="progress-bar-inner" id="progress-bar"></div>
-          </div>
-        </div>
+    TOTAL=$((OK_COUNT + FAIL_COUNT))
 
-        <div id="check-summary" class="muted" style="margin-top:8px;font-size:12px;display:none;">
-          Last check:
-          <span id="sum-ok" style="color:#bbf7d0;">0 OK</span>
-          &nbsp;·&nbsp;
-          <span id="sum-fail" style="color:#fed7aa;">0 Failed</span>
-        </div>
-      </div>
+    echo "----------------------------------------------"
+    echo -e " ${YELLOW}Summary for this check:${RESET}"
+    echo -e "  ${ORANGE}Total proxies tested${RESET} : ${TOTAL}"
+    echo -e "  ${GREEN}STATUS OK${RESET}            : ${GREEN}${OK_COUNT}${RESET}"
+    echo -e "  ${RED}Failed${RESET}               : ${RED}${FAIL_COUNT}${RESET}"
 
-      <div class="card" style="max-height:480px;overflow:auto;">
-        <table id="proxy-table">
-          <thead>
-            <tr>
-              <th>Proxy</th>
-              <th>Assigned to</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in rows %}
-              <tr data-proxy="{{ row.proxy }}">
-                <td class="proxy-cell"><code>{{ row.proxy }}</code></td>
-                <td>
-                  {% if row.client_id %}
-                    <span class="pill">Client #{{ row.client_id }}</span>
-                  {% else %}
-                    <span class="muted">Unassigned</span>
-                  {% endif %}
-                </td>
-                <td class="status-cell">
-                  <span class="status-badge status-unknown">UNKNOWN</span>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
+    # If some proxies failed, print their list in red
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+        echo
+        echo -e "${RED}Failed proxies list:${RESET}"
+        printf '%b' "$FAILED_LIST"
+        echo
+    fi
 
-      <script>
-        const checkBtn = document.getElementById('check-all-btn');
-        const table = document.getElementById('proxy-table');
-        const summaryDiv = document.getElementById('check-summary');
-        const sumOkSpan = document.getElementById('sum-ok');
-        const sumFailSpan = document.getElementById('sum-fail');
-        const progressWrapper = document.getElementById('progress-wrapper');
-        const progressBar = document.getElementById('progress-bar');
-        const progressLabel = document.getElementById('progress-label');
-        const progressDetail = document.getElementById('progress-detail');
-
-        function setStatus(proxy, status) {
-          const row = table.querySelector('tr[data-proxy="' + proxy.replace(/"/g,'&quot;') + '"]');
-          if (!row) return;
-          const cell = row.querySelector('.status-cell');
-          if (!cell) return;
-
-          let label = '';
-          let cls = 'status-badge ';
-
-          if (status === 'checking') {
-            label = 'CHECKING';
-            cls += 'status-checking';
-          } else if (status === 'ok') {
-            label = 'STATUS OK';
-            cls += 'status-ok';
-          } else if (status === 'fail') {
-            label = 'STATUS FAIL';
-            cls += 'status-fail';
-          } else {
-            label = 'UNKNOWN';
-            cls += 'status-unknown';
-          }
-          cell.innerHTML = '<span class="' + cls + '">' + label + '</span>';
-        }
-
-        async function runCheckAll() {
-          const rows = Array.from(table.querySelectorAll('tbody tr'));
-          const total = rows.length;
-          if (!total) return;
-
-          let okCount = 0;
-          let failCount = 0;
-
-          progressWrapper.style.display = 'block';
-          summaryDiv.style.display = 'none';
-          progressBar.style.width = '0%';
-          progressLabel.textContent = '0%';
-          progressDetail.textContent = 'Starting...';
-
-          rows.forEach(row => {
-            const proxy = row.getAttribute('data-proxy');
-            setStatus(proxy, 'checking');
-          });
-
-          for (let i = 0; i < total; i++) {
-            const row = rows[i];
-            const proxy = row.getAttribute('data-proxy');
-            progressDetail.textContent = 'Checking ' + (i + 1) + ' / ' + total;
-
-            try {
-              const resp = await fetch('{{ url_for("proxies_check_one") }}', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'X-Requested-With': 'XMLHttpRequest'
-                },
-                body: JSON.stringify({ proxy: proxy })
-              });
-              const data = await resp.json();
-              const status = (data && data.status === 'ok') ? 'ok' : 'fail';
-              if (status === 'ok') okCount++; else failCount++;
-              setStatus(proxy, status);
-            } catch (e) {
-              failCount++;
-              setStatus(proxy, 'fail');
-            }
-
-            const pct = Math.round(((i + 1) / total) * 100);
-            progressBar.style.width = pct + '%';
-            progressLabel.textContent = pct + '%';
-          }
-
-          progressDetail.textContent = 'Completed';
-          summaryDiv.style.display = 'block';
-          sumOkSpan.textContent = okCount + ' OK';
-          sumFailSpan.textContent = failCount + ' Failed';
-        }
-
-        if (checkBtn) {
-          checkBtn.addEventListener('click', () => {
-            runCheckAll();
-          });
-        }
-      </script>
-    """, stats=stats, rows=table_data, timeout=CHECK_TIMEOUT)
-    return render_template_string(
-        LAYOUT_TEMPLATE,
-        title=APP_TITLE,
-        page_title="Proxies",
-        body=body,
-        active="proxies",
-        stats=stats,
-    )
-
-
-@app.route("/proxies/check-one", methods=["POST"])
-@login_required
-def proxies_check_one():
-    """
-    Vérifie un seul proxy (appelé en boucle par le JS).
-    """
-    data = request.get_json(silent=True) or {}
-    proxy_line = (data.get("proxy") or "").strip()
-    if not proxy_line:
-        return jsonify({"status": "fail", "error": "no proxy"}), 400
-
-    ok = check_proxy(proxy_line)
-    return jsonify({"status": "ok" if ok else "fail"})
-
-
-@app.route("/settings", methods=["GET", "POST"])
-@login_required
-def settings():
-    stats = compute_stats()
-    cfg = get_config()
-    msg = None
-    error = None
-
-    if request.method == "POST":
-        new_user = request.form.get("username", "").strip()
-        new_pass = request.form.get("password", "")
-        confirm = request.form.get("confirm", "")
-        if new_pass and new_pass != confirm:
-            error = "Password confirmation does not match."
-        else:
-            set_admin_password(new_user or cfg["admin_username"], new_pass or None)
-            msg = "Settings updated."
-            cfg = get_config()
-
-    body = render_template_string("""
-      <h2>Settings</h2>
-      <div class="card">
-        <h3>Admin account</h3>
-        <form method="post">
-          <div class="form-row">
-            <div>
-              <label>Username</label>
-              <input type="text" name="username" value="{{ cfg.admin_username }}">
-            </div>
-          </div>
-          <div class="form-row">
-            <div>
-              <label>New password (optional)</label>
-              <input type="password" name="password" placeholder="Leave blank to keep current">
-            </div>
-            <div>
-              <label>Confirm password</label>
-              <input type="password" name="confirm" placeholder="Repeat new password">
-            </div>
-          </div>
-          {% if error %}
-            <div class="error-msg">{{ error }}</div>
-          {% endif %}
-          {% if msg %}
-            <div class="muted" style="color:#bbf7d0;margin-top:4px;">{{ msg }}</div>
-          {% endif %}
-          <button class="btn" type="submit" style="margin-top:8px;">Save settings</button>
-        </form>
-      </div>
-    """, cfg=cfg, msg=msg, error=error)
-    return render_template_string(
-        LAYOUT_TEMPLATE,
-        title=APP_TITLE,
-        page_title="Settings",
-        body=body,
-        active="settings",
-        stats=stats,
-    )
-
-
-# =============================
-# Lancement
-# =============================
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Simple proxy management panel")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=1991)
-    args = parser.parse_args()
-
-    ensure_config()
-    ensure_db()
-
-    app.run(host=args.host, port=args.port, debug=False)
-
-
-if __name__ == "__main__":
-    main()
+    echo -e " ${BLUE}Next check in 60 Sec... (Press Ctrl+C to stop)${RESET}"
+    sleep 60
+done
